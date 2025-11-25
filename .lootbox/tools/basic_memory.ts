@@ -7,10 +7,31 @@
 
 import { $ } from "bun";
 
-// Helper to run basic-memory commands
-async function runBasicMemory(args: string[]): Promise<{ success: boolean; output: string; error?: string }> {
+// Default project for basic-memory
+const DEFAULT_PROJECT = "memory";
+
+// Helper to run basic-memory tool commands
+async function runBasicMemoryTool(args: string[], project: string = DEFAULT_PROJECT): Promise<{ success: boolean; output: string; error?: string }> {
   try {
-    const result = await $`basic-memory ${args}`.quiet();
+    // basic-memory tool <command> <positional_args> --project <project> <other_options>
+    const result = await $`basic-memory tool ${args} --project ${project}`.quiet();
+    return { success: true, output: result.text() };
+  } catch (error) {
+    const err = error as { stderr?: { toString(): string }; message?: string };
+    return {
+      success: false,
+      output: "",
+      error: err.stderr?.toString() || err.message || String(error)
+    };
+  }
+}
+
+// Helper to run basic-memory commands (non-tool commands like status, sync)
+async function runBasicMemory(args: string[], project: string = DEFAULT_PROJECT): Promise<{ success: boolean; output: string; error?: string }> {
+  try {
+    // For commands like status, sync - --project goes after the command
+    const [subcommand, ...rest] = args;
+    const result = await $`basic-memory ${subcommand} --project ${project} ${rest}`.quiet();
     return { success: true, output: result.text() };
   } catch (error) {
     const err = error as { stderr?: { toString(): string }; message?: string };
@@ -23,55 +44,44 @@ async function runBasicMemory(args: string[]): Promise<{ success: boolean; outpu
 }
 
 /**
- * Write a memory to basic-memory storage
- * @param args.title - The title/permalink for the memory
- * @param args.content - The markdown content of the memory
- * @param args.folder - Optional folder to store the memory in (default: "memories")
+ * Write a note to basic-memory storage
+ * @param args.title - The title of the note
+ * @param args.content - The markdown content of the note
+ * @param args.folder - Folder to store the note in (default: "memories")
+ * @param args.tags - Optional comma-separated tags
  */
 export async function write_memory(args: {
   title: string;
   content: string;
   folder?: string;
+  tags?: string;
 }): Promise<{ success: boolean; permalink?: string; error?: string }> {
-  const { title, content, folder = "memories" } = args;
+  const { title, content, folder = "memories", tags } = args;
 
-  // Create the memory content with frontmatter
-  const memoryContent = `---
-title: ${title}
----
-
-${content}`;
-
-  // Write to a temp file first, then import
-  const tempFile = `/tmp/memory_${Date.now()}.md`;
-  await Bun.write(tempFile, memoryContent);
-
-  try {
-    // Use basic-memory import command
-    const result = await runBasicMemory(["import", tempFile, "--folder", folder]);
-
-    // Clean up temp file
-    await Bun.file(tempFile).exists() && await $`rm ${tempFile}`.quiet();
-
-    if (result.success) {
-      return { success: true, permalink: title.toLowerCase().replace(/\s+/g, "-") };
-    }
-    return { success: false, error: result.error };
-  } catch (error) {
-    return { success: false, error: String(error) };
+  const cmdArgs = ["write-note", "--title", title, "--folder", folder, "--content", content];
+  if (tags) {
+    cmdArgs.push("--tags", tags);
   }
+
+  const result = await runBasicMemoryTool(cmdArgs);
+
+  if (result.success) {
+    return { success: true, permalink: title.toLowerCase().replace(/\s+/g, "-") };
+  }
+  return { success: false, error: result.error };
 }
 
 /**
- * Read a memory by its permalink
- * @param args.permalink - The permalink of the memory to read
+ * Read a note by its permalink/identifier
+ * @param args.permalink - The permalink/path of the note to read (e.g., "memories/my-note" or just "my-note")
  */
 export async function read_memory(args: {
   permalink: string;
 }): Promise<{ success: boolean; content?: string; error?: string }> {
   const { permalink } = args;
 
-  const result = await runBasicMemory(["read", permalink]);
+  // read-note takes IDENTIFIER as positional argument
+  const result = await runBasicMemoryTool(["read-note", permalink]);
 
   if (result.success) {
     return { success: true, content: result.output };
@@ -82,62 +92,62 @@ export async function read_memory(args: {
 /**
  * Search memories using semantic search
  * @param args.query - The search query
- * @param args.limit - Maximum number of results (default: 10)
+ * @param args.page_size - Maximum number of results (default: 10)
  */
 export async function search_memories(args: {
   query: string;
-  limit?: number;
-}): Promise<{ success: boolean; results?: string[]; error?: string }> {
-  const { query, limit = 10 } = args;
+  page_size?: number;
+}): Promise<{ success: boolean; results?: string; error?: string }> {
+  const { query, page_size = 10 } = args;
 
-  const result = await runBasicMemory(["search", query, "--limit", String(limit)]);
+  // search-notes takes QUERY as positional argument
+  const cmdArgs = ["search-notes", query, "--page-size", String(page_size)];
+  const result = await runBasicMemoryTool(cmdArgs);
 
   if (result.success) {
-    const lines = result.output.trim().split("\n").filter(line => line.trim());
-    return { success: true, results: lines };
+    return { success: true, results: result.output };
   }
   return { success: false, error: result.error };
 }
 
 /**
- * List all memories, optionally filtered by folder
- * @param args.folder - Optional folder to filter by
+ * Get recent activity across the knowledge base
+ * @param args.page_size - Maximum number of items (default: 10)
  */
 export async function list_memories(args: {
-  folder?: string;
-}): Promise<{ success: boolean; memories?: string[]; error?: string }> {
-  const { folder } = args;
+  page_size?: number;
+}): Promise<{ success: boolean; memories?: string; error?: string }> {
+  const { page_size = 10 } = args;
 
-  const cmdArgs = ["list"];
-  if (folder) {
-    cmdArgs.push("--folder", folder);
-  }
-
-  const result = await runBasicMemory(cmdArgs);
+  const cmdArgs = ["recent-activity", "--page-size", String(page_size)];
+  const result = await runBasicMemoryTool(cmdArgs);
 
   if (result.success) {
-    const lines = result.output.trim().split("\n").filter(line => line.trim());
-    return { success: true, memories: lines };
+    return { success: true, memories: result.output };
   }
   return { success: false, error: result.error };
 }
 
 /**
- * Delete a memory by its permalink
- * @param args.permalink - The permalink of the memory to delete
+ * Build context for a topic or discussion
+ * @param args.topic - The topic to build context for
  */
-export async function delete_memory(args: {
-  permalink: string;
-}): Promise<{ success: boolean; error?: string }> {
-  const { permalink } = args;
+export async function build_context(args: {
+  topic: string;
+}): Promise<{ success: boolean; context?: string; error?: string }> {
+  const { topic } = args;
 
-  const result = await runBasicMemory(["delete", permalink]);
+  // build-context takes TOPIC as positional argument
+  const result = await runBasicMemoryTool(["build-context", topic]);
 
-  return { success: result.success, error: result.error };
+  if (result.success) {
+    return { success: true, context: result.output };
+  }
+  return { success: false, error: result.error };
 }
 
 /**
- * Sync the memory database (rebuild index)
+ * Sync the memory database
  */
 export async function sync_memories(args: Record<string, never> = {}): Promise<{ success: boolean; output?: string; error?: string }> {
   const result = await runBasicMemory(["sync"]);

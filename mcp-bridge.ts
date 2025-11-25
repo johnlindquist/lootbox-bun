@@ -144,7 +144,7 @@ async function callFunction(
       ws.send(
         JSON.stringify({
           method: `${namespace}.${funcName}`,
-          args: [args],
+          args: args,  // Pass args directly, not wrapped in array
           id: callId,
         })
       );
