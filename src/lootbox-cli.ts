@@ -1,4 +1,5 @@
-import { parseArgs } from "@std/cli";
+#!/usr/bin/env bun
+import minimist from "minimist";
 import { loadConfig } from "./lib/lootbox-cli/config.ts";
 import { executeScript, getScriptFromArgs, execInline } from "./lib/lootbox-cli/exec.ts";
 import {
@@ -29,7 +30,7 @@ import {
 import { VERSION } from "./version.ts";
 
 async function main() {
-  const args = parseArgs(Deno.args, {
+  const args = minimist(process.argv.slice(2), {
     string: ["eval", "server", "types", "end-loop", "abort"],
     boolean: [
       "help",
@@ -50,22 +51,22 @@ async function main() {
 
   if (args.help || args["human-help"]) {
     showHumanHelp();
-    Deno.exit(0);
+    process.exit(0);
   }
 
   if (args["llm-help"]) {
     showLlmHelp();
-    Deno.exit(0);
+    process.exit(0);
   }
 
   if (args.version) {
     console.log(`lootbox v${VERSION}`);
-    Deno.exit(0);
+    process.exit(0);
   }
 
   if (args["config-help"]) {
     showConfigHelp();
-    Deno.exit(0);
+    process.exit(0);
   }
 
   // Handle init command
@@ -103,13 +104,13 @@ async function main() {
       if (!namespaces) {
         console.error("Error: tools types requires namespace argument");
         console.error("Usage: lootbox tools types <ns1,ns2,...>");
-        Deno.exit(1);
+        process.exit(1);
       }
       await toolsTypes(namespaces, serverUrl);
     } else {
       console.error(`Error: Unknown tools command '${toolsCommand}'`);
       console.error("Available commands: list, types");
-      Deno.exit(1);
+      process.exit(1);
     }
     return;
   }
@@ -120,7 +121,7 @@ async function main() {
     if (!code) {
       console.error("Error: exec requires code argument");
       console.error("Usage: lootbox exec '<code>'");
-      Deno.exit(1);
+      process.exit(1);
     }
 
     // Load config for serverUrl
@@ -147,7 +148,7 @@ async function main() {
         if (workflowArgs.length === 0) {
           console.error("Error: workflow start requires a file argument");
           console.error("Usage: lootbox workflow start <file.yaml>");
-          Deno.exit(1);
+          process.exit(1);
         }
         await workflowStart(workflowArgs[0]);
         break;
@@ -164,14 +165,14 @@ async function main() {
         if (!args.abort) {
           console.error("Error: --abort requires a reason");
           console.error('Usage: lootbox workflow abort --abort="reason"');
-          Deno.exit(1);
+          process.exit(1);
         }
         await workflowAbort(args.abort as string);
         break;
       default:
         console.error(`Error: Unknown workflow command '${workflowCommand}'`);
         console.error("Available commands: start, step, reset, status, abort");
-        Deno.exit(1);
+        process.exit(1);
     }
     return;
   }
@@ -193,13 +194,13 @@ async function main() {
       if (scriptsArgs.length === 0) {
         console.error("Error: scripts init requires a filename argument");
         console.error("Usage: lootbox scripts init <filename>");
-        Deno.exit(1);
+        process.exit(1);
       }
       await scriptsInit(scriptsArgs[0]);
     } else {
       console.error(`Error: Unknown scripts command '${scriptsCommand}'`);
       console.error("Available commands: list, init");
-      Deno.exit(1);
+      process.exit(1);
     }
     return;
   }
@@ -227,13 +228,14 @@ async function main() {
 
   if (!script.trim()) {
     console.error("Error: Empty script");
-    Deno.exit(1);
+    process.exit(1);
   }
 
   // Execute the script
   await executeScript(script, serverUrl);
 }
 
+// Bun supports import.meta.main
 if (import.meta.main) {
   main();
 }

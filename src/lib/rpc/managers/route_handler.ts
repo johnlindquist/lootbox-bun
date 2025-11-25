@@ -10,7 +10,7 @@
  * - WebSocket endpoints (client and worker)
  */
 
-import type { Hono } from "@hono/hono";
+import type { Hono } from "hono";
 import type { RpcCacheManager } from "./rpc_cache_manager.ts";
 import type { TypeGeneratorManager } from "./type_generator_manager.ts";
 import type { McpIntegrationManager } from "./mcp_integration_manager.ts";

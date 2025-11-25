@@ -1,12 +1,12 @@
-import { parseArgs } from "@std/cli";
-import { exists } from "https://deno.land/std@0.208.0/fs/mod.ts";
+import minimist from "minimist";
+import { existsSync } from "fs";
 import type { Config, McpServerConfig } from "./lootbox-cli/types.ts";
 import {
   getUserLootboxToolsDir,
   getUserLootboxWorkflowsDir,
   getUserLootboxScriptsDir
 } from "./paths.ts";
-import { join, dirname } from "https://deno.land/std@0.208.0/path/mod.ts";
+import { dirname } from "path";
 
 interface ResolvedConfig {
   lootbox_root: string;
@@ -20,15 +20,27 @@ interface ResolvedConfig {
 
 async function loadConfig(): Promise<Config> {
   try {
-    const configText = await Deno.readTextFile("lootbox.config.json");
+    const configText = await Bun.file("lootbox.config.json").text();
     return JSON.parse(configText);
   } catch {
     return {};
   }
 }
 
+// Store args override for server command
+let argsOverride: string[] | null = null;
+
+export function setArgsOverride(args: string[]): void {
+  argsOverride = args;
+}
+
+export function clearArgsOverride(): void {
+  argsOverride = null;
+}
+
 export const get_config = async (): Promise<ResolvedConfig> => {
-  const args = parseArgs(Deno.args, {
+  const rawArgs = argsOverride ?? process.argv.slice(2);
+  const args = minimist(rawArgs, {
     string: ["lootbox-root", "port", "lootbox-data-dir"],
     alias: {
       "lootbox-root": "r",
@@ -61,7 +73,7 @@ export const get_config = async (): Promise<ResolvedConfig> => {
   } else {
     // Check local .lootbox/tools first
     const localToolsDir = ".lootbox/tools";
-    if (await exists(localToolsDir)) {
+    if (existsSync(localToolsDir)) {
       lootboxRoot = ".lootbox";
       toolsDir = localToolsDir;
       workflowsDir = `${lootboxRoot}/workflows`;
@@ -69,7 +81,7 @@ export const get_config = async (): Promise<ResolvedConfig> => {
     } else {
       // Fallback to home directory
       const homeToolsDir = getUserLootboxToolsDir();
-      if (await exists(homeToolsDir)) {
+      if (existsSync(homeToolsDir)) {
         lootboxRoot = dirname(homeToolsDir);
         toolsDir = homeToolsDir;
         workflowsDir = getUserLootboxWorkflowsDir();
@@ -81,7 +93,7 @@ export const get_config = async (): Promise<ResolvedConfig> => {
         console.error(`  • ${localToolsDir}`);
         console.error(`  • ${homeToolsDir}`);
         console.error("\n💡 Run 'lootbox init' to create a new lootbox project.\n");
-        Deno.exit(1);
+        process.exit(1);
       }
     }
   }
@@ -94,7 +106,7 @@ export const get_config = async (): Promise<ResolvedConfig> => {
   const port = parseInt(portStr, 10);
   if (isNaN(port)) {
     console.error("Error: --port must be a valid number");
-    Deno.exit(1);
+    process.exit(1);
   }
 
   return {

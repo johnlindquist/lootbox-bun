@@ -1,5 +1,7 @@
 // MCP server configuration management
 
+import { existsSync } from "fs";
+
 export interface McpServerConfig {
   command: string;
   args: string[];
@@ -23,11 +25,12 @@ export interface McpConfigFile {
  */
 export async function loadMcpConfig(path: string): Promise<McpConfigFile> {
   try {
-    const content = await Deno.readTextFile(path);
+    const content = await Bun.file(path).text();
     const parsed = JSON.parse(content);
     return validateMcpConfig(parsed);
   } catch (error) {
-    if (error instanceof Deno.errors.NotFound) {
+    // Check if file doesn't exist
+    if (!existsSync(path)) {
       throw new Error(`MCP config file not found: ${path}`);
     }
     if (error instanceof SyntaxError) {

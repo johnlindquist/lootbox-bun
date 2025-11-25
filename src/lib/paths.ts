@@ -1,12 +1,12 @@
 // Path utilities for lootbox directories
 
-import { join } from "https://deno.land/std@0.208.0/path/mod.ts";
+import { join } from "path";
 
 /**
  * Get the user's home directory
  */
 function getHomeDir(): string {
-  const home = Deno.env.get("HOME") || Deno.env.get("USERPROFILE");
+  const home = process.env.HOME || process.env.USERPROFILE;
   if (!home) {
     throw new Error("Could not determine home directory");
   }

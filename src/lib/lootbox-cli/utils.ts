@@ -10,10 +10,11 @@ export function wsUrlToHttpUrl(wsUrl: string): string {
     .replace(/\/ws$/, "");
 }
 
-import { removeSlashes } from "npm:slashes@3.0.12";
+import { removeSlashes } from "slashes";
 
 export async function readStdin(): Promise<string> {
-  const raw = await new Response(Deno.stdin.readable).text();
+  // Read stdin using Bun's file API
+  const raw = await Bun.stdin.text();
   // Remove bash-escaped backslashes like \!
   return removeSlashes(raw);
 }

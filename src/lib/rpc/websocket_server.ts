@@ -11,9 +11,8 @@
  */
 
 import { OpenAPIHono } from "@hono/zod-openapi";
-import type { Hono } from "@hono/hono";
-import { upgradeWebSocket } from "@hono/hono/deno";
-import type { Spinner } from "@std/cli/unstable-spinner";
+import type { Hono } from "hono";
+import type { Ora } from "ora";
 import { get_client, set_client } from "../client_cache.ts";
 import type { McpConfigFile } from "../external-mcps/mcp_config.ts";
 import { WorkerManager } from "./worker_manager.ts";
@@ -40,6 +39,7 @@ export class WebSocketRpcServer {
   private workerManager: WorkerManager | null = null;
 
   private currentPort = 0;
+  private server: ReturnType<typeof Bun.serve> | null = null;
 
   constructor() {
     // Initialize independent managers
@@ -100,7 +100,7 @@ export class WebSocketRpcServer {
   /**
    * Start the RPC server
    */
-  async start(port: number, mcpConfig: McpConfigFile | null, spinner?: Spinner): Promise<void> {
+  async start(port: number, mcpConfig: McpConfigFile | null, spinner?: Ora): Promise<void> {
     this.currentPort = port;
 
     // Get config early
@@ -141,8 +141,49 @@ export class WebSocketRpcServer {
       await this.rpcCacheManager.refreshCache();
     });
 
-    // Phase 8: Start HTTP server
-    Deno.serve({ port, onListen: () => {} }, this.app.fetch);
+    // Phase 8: Start HTTP server using Bun
+    const honoFetch = this.app.fetch.bind(this.app);
+    const connectionManager = this.connectionManager;
+    const messageRouter = this.messageRouter;
+    const rpcCacheManager = this.rpcCacheManager;
+    const workerManager = this.workerManager!;
+
+    this.server = Bun.serve({
+      port,
+      fetch(req, server) {
+        // Check for WebSocket upgrade
+        const url = new URL(req.url);
+        if (url.pathname === "/ws" || url.pathname === "/worker-ws") {
+          const upgraded = server.upgrade(req, {
+            data: { path: url.pathname },
+          });
+          if (upgraded) {
+            return undefined; // Return undefined for successful upgrade
+          }
+          return new Response("WebSocket upgrade failed", { status: 400 });
+        }
+
+        // Handle regular HTTP requests with Hono
+        return honoFetch(req, server);
+      },
+      websocket: {
+        open(ws) {
+          connectionManager.handleWebSocketOpen(ws);
+        },
+        message(ws, message) {
+          connectionManager.handleWebSocketMessage(
+            ws,
+            message,
+            messageRouter,
+            () => rpcCacheManager.getFunctionNames(),
+            workerManager
+          );
+        },
+        close(ws) {
+          connectionManager.handleWebSocketClose(ws);
+        },
+      },
+    });
 
     // Give server time to start
     await new Promise((resolve) => setTimeout(resolve, 100));
@@ -189,6 +230,12 @@ export class WebSocketRpcServer {
     // Stop file watcher
     this.fileWatcherManager.stopWatching();
 
+    // Stop Bun server
+    if (this.server) {
+      this.server.stop();
+      this.server = null;
+    }
+
     console.error("RPC server stopped");
   }
 
@@ -210,35 +257,22 @@ export class WebSocketRpcServer {
     // Setup UI routes
     setupUIRoutes(this.app);
 
-    // Setup WebSocket routes (cannot be documented via OpenAPI)
-    this.setupWebSocketRoutes();
-  }
+    // Setup WebSocket upgrade route
+    this.app.get("/ws", (c) => {
+      const upgradeHeader = c.req.header("Upgrade");
+      if (upgradeHeader !== "websocket") {
+        return c.text("Expected WebSocket upgrade", 426);
+      }
+      // Bun handles WebSocket upgrade via the websocket handler in Bun.serve
+      return new Response(null, { status: 101 });
+    });
 
-  /**
-   * Setup WebSocket routes
-   * Note: WebSocket routes cannot be documented via OpenAPI specification
-   */
-  private setupWebSocketRoutes(): void {
-    // Cast to Hono for WebSocket routes (OpenAPIHono extends Hono but upgradeWebSocket has strict typing)
-    const honoApp = this.app as unknown as Hono;
-
-    honoApp.get(
-      "/worker-ws",
-      upgradeWebSocket(() => {
-        return this.connectionManager.createWorkerWebSocketHandler(
-          this.workerManager!
-        );
-      })
-    );
-
-    honoApp.get(
-      "/ws",
-      upgradeWebSocket(() => {
-        return this.connectionManager.createClientWebSocketHandler(
-          this.messageRouter,
-          () => this.rpcCacheManager.getFunctionNames()
-        );
-      })
-    );
+    this.app.get("/worker-ws", (c) => {
+      const upgradeHeader = c.req.header("Upgrade");
+      if (upgradeHeader !== "websocket") {
+        return c.text("Expected WebSocket upgrade", 426);
+      }
+      return new Response(null, { status: 101 });
+    });
   }
 }

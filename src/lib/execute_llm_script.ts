@@ -1,5 +1,8 @@
 import { saveScriptRun } from "./script_history.ts";
 import { get_client } from "./client_cache.ts";
+import { unlink, mkdtemp, writeFile } from "fs/promises";
+import { join } from "path";
+import { tmpdir } from "os";
 
 export const execute_llm_script = async (args: { script: string; sessionId?: string }) => {
   const { script, sessionId } = args;
@@ -17,39 +20,57 @@ export const execute_llm_script = async (args: { script: string; sessionId?: str
   // Inject import statement at the top of the user script
   const injectedScript = `import { tools } from "${clientUrl}";\n\n// User script begins here\n${script}`;
 
-  const tempFile = await Deno.makeTempFile({ suffix: ".ts" });
-  console.error(`📁 Created temp file: ${tempFile}`);
-  await Deno.writeTextFile(tempFile, injectedScript);
+  let tempFile: string | null = null;
 
   try {
+    // Create temp file
+    const tempDir = await mkdtemp(join(tmpdir(), "lootbox-script-"));
+    tempFile = join(tempDir, "script.ts");
+    console.error(`📁 Created temp file: ${tempFile}`);
+    await writeFile(tempFile, injectedScript);
+
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 10000); // 10 second timeout
 
-    const { success, stdout, stderr } = await new Deno.Command("deno", {
-      args: [
-        "run",
-        "--allow-net", // Only allow network access for user scripts (sandboxed)
-        `--allow-import=localhost:${config.port}`, // Allow importing from local RPC server
-        `--reload=http://localhost:${config.port}/client.ts`, // Force reload client on each execution
-        "--no-check=remote", // Don't check remote imports
-        tempFile,
-      ],
-      stdout: "piped",
-      stderr: "piped",
-      signal: controller.signal,
-    }).output();
+    const proc = Bun.spawn(["bun", "run", tempFile], {
+      stdout: "pipe",
+      stderr: "pipe",
+    });
 
-    clearTimeout(timeoutId);
+    // Handle timeout
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      controller.signal.addEventListener("abort", () => {
+        proc.kill();
+        reject(new Error("AbortError"));
+      });
+    });
 
-    const outStr = new TextDecoder().decode(stdout);
-    const errStr = new TextDecoder().decode(stderr);
+    const resultPromise = (async () => {
+      const [stdout, stderr] = await Promise.all([
+        new Response(proc.stdout).text(),
+        new Response(proc.stderr).text(),
+      ]);
+      const exitCode = await proc.exited;
+      return { exitCode, stdout, stderr };
+    })();
+
+    let result: { exitCode: number; stdout: string; stderr: string };
+    try {
+      result = await Promise.race([resultPromise, timeoutPromise]);
+    } finally {
+      clearTimeout(timeoutId);
+    }
+
+    const { exitCode, stdout: outStr, stderr: errStr } = result;
 
     // Clean up temp file
-    await Deno.remove(tempFile).catch(() => {});
+    if (tempFile) {
+      await unlink(tempFile).catch(() => {});
+    }
 
     const durationMs = Date.now() - startTime;
 
-    if (!success) {
+    if (exitCode !== 0) {
       const error = errStr || "Script execution failed";
 
       // Save failed run
@@ -87,11 +108,13 @@ export const execute_llm_script = async (args: { script: string; sessionId?: str
     };
   } catch (error) {
     // Clean up temp file
-    await Deno.remove(tempFile).catch(() => {});
+    if (tempFile) {
+      await unlink(tempFile).catch(() => {});
+    }
 
     const durationMs = Date.now() - startTime;
 
-    if (error instanceof Error && error.name === "AbortError") {
+    if (error instanceof Error && error.message === "AbortError") {
       const errorMsg = "Script execution timeout (10 seconds)";
 
       // Save timeout run

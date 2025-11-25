@@ -1,6 +1,7 @@
 import type { ExecResponse } from "./types.ts";
 import { generateId, readStdin } from "./utils.ts";
 import { get_config } from "../get_config.ts";
+import { existsSync } from "fs";
 
 /**
  * Execute inline code directly
@@ -22,7 +23,7 @@ export async function executeScript(
       `Error connecting to ${serverUrl}:`,
       error instanceof Error ? error.message : String(error)
     );
-    Deno.exit(1);
+    process.exit(1);
   }
 
   const id = generateId();
@@ -39,7 +40,7 @@ export async function executeScript(
     ws.onmessage = (event) => {
       clearTimeout(timeout);
       try {
-        const response = JSON.parse(event.data) as ExecResponse;
+        const response = JSON.parse(event.data as string) as ExecResponse;
         if (response.id === id) {
           ws.close();
           resolve(response);
@@ -77,42 +78,40 @@ export async function executeScript(
 
     if (response.error) {
       console.error(response.error);
-      Deno.exit(1);
+      process.exit(1);
     }
 
     if (response.result) {
       // Output result to stdout (trim trailing newline if present for clean piping)
       const output = response.result;
-      Deno.stdout.writeSync(new TextEncoder().encode(output));
+      process.stdout.write(output);
     }
 
-    Deno.exit(0);
+    process.exit(0);
   } catch (error) {
     console.error(
       "Execution failed:",
       error instanceof Error ? error.message : String(error)
     );
-    Deno.exit(1);
+    process.exit(1);
   }
 }
 
 async function resolveScriptPath(file: string): Promise<string> {
   // Try the path as-is first
-  try {
-    await Deno.stat(file);
+  if (existsSync(file)) {
     return file;
-  } catch {
-    // If not found, try in scripts directory
-    const config = await get_config();
-    const fallbackPath = `${config.scripts_dir}/${file}`;
-    try {
-      await Deno.stat(fallbackPath);
-      return fallbackPath;
-    } catch {
-      // Return original path so error message is accurate
-      return file;
-    }
   }
+
+  // If not found, try in scripts directory
+  const config = await get_config();
+  const fallbackPath = `${config.scripts_dir}/${file}`;
+  if (existsSync(fallbackPath)) {
+    return fallbackPath;
+  }
+
+  // Return original path so error message is accurate
+  return file;
 }
 
 export async function getScriptFromArgs(
@@ -126,30 +125,30 @@ export async function getScriptFromArgs(
   } else if (args.length > 0) {
     const filePath = await resolveScriptPath(args[0]);
     try {
-      script = await Deno.readTextFile(filePath);
+      script = await Bun.file(filePath).text();
     } catch (error) {
       console.error(
         `Error reading file '${filePath}':`,
         error instanceof Error ? error.message : String(error)
       );
-      Deno.exit(1);
+      process.exit(1);
     }
   } else {
     // Check if stdin is a TTY (interactive terminal)
-    if (Deno.stdin.isTerminal()) {
+    if (process.stdin.isTTY) {
       console.error("Error: No script provided");
       console.error(
         "Usage: lootbox [file] or lootbox -e 'script' or pipe via stdin"
       );
       console.error("Run 'lootbox --help' for more information");
-      Deno.exit(1);
+      process.exit(1);
     }
     // Read from stdin
     return await readStdin();
   }
 
   // If stdin is piped, prepend it as a global variable for both -e and file cases
-  if (!Deno.stdin.isTerminal()) {
+  if (!process.stdin.isTTY) {
     const stdinData = await readStdin();
     script = `const $STDIN = ${JSON.stringify(stdinData)};
 const stdin = (defaultValue = "") => {

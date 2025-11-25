@@ -2,7 +2,7 @@
  * Lootbox branded bootup display - inspired by Vite
  */
 
-import type { Spinner } from "@std/cli/unstable-spinner";
+import type { Ora } from "ora";
 import { VERSION } from "../../version.ts";
 
 interface BootupInfo {
@@ -10,7 +10,7 @@ interface BootupInfo {
   toolsDir: string;
   mcpServers: string[];
   rpcFunctions: string[];
-  spinner?: Spinner;
+  spinner?: Ora;
 }
 
 export function showBootup(info: BootupInfo): void {
@@ -20,7 +20,7 @@ export function showBootup(info: BootupInfo): void {
   if (spinner) {
     spinner.stop();
     // Clear the spinner line
-    Deno.stdout.writeSync(new TextEncoder().encode("\r\x1b[K"));
+    process.stdout.write("\r\x1b[K");
   }
 
   console.log(

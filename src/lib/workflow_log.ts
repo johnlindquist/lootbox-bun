@@ -39,7 +39,7 @@ export async function logWorkflowEvent(event: Omit<WorkflowEvent, "id">): Promis
   try {
     const db = await getDb();
 
-    db.query(
+    db.run(
       `INSERT INTO workflow_events (
         timestamp, event_type, workflow_file, step_number,
         loop_iteration, reason, session_id
@@ -62,6 +62,17 @@ export async function logWorkflowEvent(event: Omit<WorkflowEvent, "id">): Promis
   }
 }
 
+interface WorkflowEventRow {
+  id: number;
+  timestamp: number;
+  event_type: string;
+  workflow_file: string;
+  step_number: number | null;
+  loop_iteration: number | null;
+  reason: string | null;
+  session_id: string | null;
+}
+
 /**
  * Get recent workflow events
  */
@@ -69,23 +80,13 @@ export async function getRecentEvents(limit = 50): Promise<WorkflowEvent[]> {
   try {
     const db = await getDb();
 
-    const results = db.queryEntries<{
-      id: number;
-      timestamp: number;
-      event_type: string;
-      workflow_file: string;
-      step_number: number | null;
-      loop_iteration: number | null;
-      reason: string | null;
-      session_id: string | null;
-    }>(
+    const results = db.query<WorkflowEventRow, [number]>(
       `SELECT id, timestamp, event_type, workflow_file, step_number,
               loop_iteration, reason, session_id
        FROM workflow_events
        ORDER BY timestamp DESC
-       LIMIT ?`,
-      [limit]
-    );
+       LIMIT ?`
+    ).all(limit);
 
     return results as WorkflowEvent[];
   } catch (error) {
@@ -104,24 +105,14 @@ export async function getEventsForWorkflow(workflowFile: string, limit = 100): P
   try {
     const db = await getDb();
 
-    const results = db.queryEntries<{
-      id: number;
-      timestamp: number;
-      event_type: string;
-      workflow_file: string;
-      step_number: number | null;
-      loop_iteration: number | null;
-      reason: string | null;
-      session_id: string | null;
-    }>(
+    const results = db.query<WorkflowEventRow, [string, number]>(
       `SELECT id, timestamp, event_type, workflow_file, step_number,
               loop_iteration, reason, session_id
        FROM workflow_events
        WHERE workflow_file = ?
        ORDER BY timestamp DESC
-       LIMIT ?`,
-      [workflowFile, limit]
-    );
+       LIMIT ?`
+    ).all(workflowFile, limit);
 
     return results as WorkflowEvent[];
   } catch (error) {
@@ -140,23 +131,13 @@ export async function getEventsForSession(sessionId: string): Promise<WorkflowEv
   try {
     const db = await getDb();
 
-    const results = db.queryEntries<{
-      id: number;
-      timestamp: number;
-      event_type: string;
-      workflow_file: string;
-      step_number: number | null;
-      loop_iteration: number | null;
-      reason: string | null;
-      session_id: string | null;
-    }>(
+    const results = db.query<WorkflowEventRow, [string]>(
       `SELECT id, timestamp, event_type, workflow_file, step_number,
               loop_iteration, reason, session_id
        FROM workflow_events
        WHERE session_id = ?
-       ORDER BY timestamp ASC`,
-      [sessionId]
-    );
+       ORDER BY timestamp ASC`
+    ).all(sessionId);
 
     return results as WorkflowEvent[];
   } catch (error) {

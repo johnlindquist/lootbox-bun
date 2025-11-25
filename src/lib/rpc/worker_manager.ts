@@ -1,6 +1,10 @@
 // Worker Manager - Manages lifecycle of RPC worker processes
 
 import type { RpcFile } from "./load_rpc_files.ts";
+import { tmpdir } from "os";
+import { join } from "path";
+import { randomUUID } from "crypto";
+import type { Subprocess } from "bun";
 
 // Inline worker code to avoid path resolution issues in compiled binaries
 const RPC_WORKER_CODE = `
@@ -21,14 +25,14 @@ interface ShutdownMessage {
 type WorkerMessage = CallMessage | ShutdownMessage;
 
 async function main() {
-  // Parse CLI arguments
-  const rpcFilePath = Deno.args[0];
-  const workerWsUrl = Deno.args[1];
-  const namespace = Deno.args[2];
+  // Parse CLI arguments (Bun uses process.argv)
+  const rpcFilePath = process.argv[2];
+  const workerWsUrl = process.argv[3];
+  const namespace = process.argv[4];
 
   if (!rpcFilePath || !workerWsUrl || !namespace) {
     console.error("Usage: rpc_worker.ts <rpcFilePath> <workerWsUrl> <namespace>");
-    Deno.exit(1);
+    process.exit(1);
   }
 
   // Import all functions from RPC file
@@ -97,7 +101,7 @@ async function main() {
       } else if (msg.type === "shutdown") {
         console.error(\`[Worker \${namespace}] Received shutdown signal\`);
         ws.close();
-        Deno.exit(0);
+        process.exit(0);
       }
     } catch (error) {
       console.error(\`[Worker \${namespace}] Error handling message:\`, error);
@@ -114,41 +118,41 @@ async function main() {
 
   ws.onclose = () => {
     // Silent exit on close
-    Deno.exit(0);
+    process.exit(0);
   };
 
   // Handle uncaught errors
-  globalThis.addEventListener("error", (event) => {
-    console.error(\`[Worker \${namespace}] Uncaught error:\`, event.error);
+  process.on("uncaughtException", (error) => {
+    console.error(\`[Worker \${namespace}] Uncaught error:\`, error);
 
     try {
       ws.send(JSON.stringify({
         type: "crash",
-        error: event.error?.message || String(event.error),
+        error: error?.message || String(error),
       }));
     } catch {
       // Best effort
     }
 
     ws.close();
-    Deno.exit(1);
+    process.exit(1);
   });
 
   // Handle unhandled promise rejections
-  globalThis.addEventListener("unhandledrejection", (event) => {
-    console.error(\`[Worker \${namespace}] Unhandled rejection:\`, event.reason);
+  process.on("unhandledRejection", (reason) => {
+    console.error(\`[Worker \${namespace}] Unhandled rejection:\`, reason);
 
     try {
       ws.send(JSON.stringify({
         type: "crash",
-        error: event.reason?.message || String(event.reason),
+        error: (reason as Error)?.message || String(reason),
       }));
     } catch {
       // Best effort
     }
 
     ws.close();
-    Deno.exit(1);
+    process.exit(1);
   });
 }
 
@@ -156,7 +160,7 @@ main();
 `;
 
 interface WorkerState {
-  process: Deno.ChildProcess;
+  process: Subprocess;
   sendMessage?: (message: string) => void; // Callback to send messages to worker
   workerId: string;
   filePath: string;
@@ -166,7 +170,7 @@ interface WorkerState {
     {
       resolve: (value: unknown) => void;
       reject: (error: Error) => void;
-      timeoutId: number;
+      timeoutId: ReturnType<typeof setTimeout>;
     }
   >;
   restartCount: number;
@@ -223,29 +227,19 @@ export class WorkerManager {
     const workerId = file.name;
 
     // Write worker code to temp file
-    const tempFile = await Deno.makeTempFile({ prefix: "lootbox_worker_", suffix: ".ts" });
-    await Deno.writeTextFile(tempFile, RPC_WORKER_CODE);
+    const tempFile = join(tmpdir(), `lootbox_worker_${randomUUID()}.ts`);
+    await Bun.write(tempFile, RPC_WORKER_CODE);
 
-    // Spawn worker process
+    // Spawn worker process using Bun
     const workerWsUrl = `ws://localhost:${this.port}/worker-ws`;
-    const command = new Deno.Command("deno", {
-      args: [
-        "run",
-        "--allow-all",
-        tempFile,
-        file.path,
-        workerWsUrl,
-        workerId,
-      ],
-      stdout: "piped",
+    const proc = Bun.spawn(["bun", "run", tempFile, file.path, workerWsUrl, workerId], {
+      stdout: "pipe",
       stderr: "inherit", // Show worker logs in main process
     });
 
-    const process = command.spawn();
-
     // Create worker state
     const worker: WorkerState = {
-      process,
+      process: proc,
       workerId,
       filePath: file.path,
       status: "starting",
@@ -258,10 +252,10 @@ export class WorkerManager {
     this.workers.set(workerId, worker);
 
     // Monitor process exit
-    process.status.then((status) => {
-      if (!status.success) {
+    proc.exited.then((exitCode) => {
+      if (exitCode !== 0) {
         console.error(
-          `[WorkerManager] Worker ${workerId} exited with code ${status.code}`
+          `[WorkerManager] Worker ${workerId} exited with code ${exitCode}`
         );
         this.handleWorkerCrash(workerId);
       }
@@ -479,7 +473,7 @@ export class WorkerManager {
 
       // Force kill if still alive
       try {
-        worker.process.kill("SIGKILL");
+        worker.process.kill(9); // SIGKILL
       } catch {
         // Already dead
       }
@@ -543,7 +537,7 @@ export class WorkerManager {
       }
 
       try {
-        worker.process.kill("SIGTERM");
+        worker.process.kill(15); // SIGTERM
       } catch {
         // Already dead
       }

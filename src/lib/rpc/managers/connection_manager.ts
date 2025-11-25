@@ -8,10 +8,12 @@
  * - Broadcasting messages to all connected clients
  * - Welcome messages with available functions
  * - WebSocket handler creation for Hono routes
+ * - Bun-native WebSocket handlers
  */
 
 import type { MessageRouter } from "./message_router.ts";
 import type { WorkerManager } from "../worker_manager.ts";
+import type { ServerWebSocket } from "bun";
 
 // Type for Hono WebSocket context
 interface WebSocketContext {
@@ -28,6 +30,8 @@ export interface WebSocketHandler {
 
 export class ConnectionManager {
   private clients = new Set<WebSocketContext>();
+  private bunClients = new Set<ServerWebSocket<unknown>>();
+  private bunWorkers = new Map<string, ServerWebSocket<unknown>>();
 
   /**
    * Add a client WebSocket connection
@@ -88,7 +92,93 @@ export class ConnectionManager {
    * Get number of connected clients
    */
   getClientCount(): number {
-    return this.clients.size;
+    return this.clients.size + this.bunClients.size;
+  }
+
+  /**
+   * Handle Bun WebSocket open event
+   */
+  handleWebSocketOpen(ws: ServerWebSocket<unknown>): void {
+    // Initially add to bunClients - will be moved to workers if it identifies as one
+    this.bunClients.add(ws);
+  }
+
+  /**
+   * Handle Bun WebSocket message event
+   */
+  async handleWebSocketMessage(
+    ws: ServerWebSocket<unknown>,
+    message: string | Buffer,
+    messageRouter: MessageRouter,
+    availableFunctions: () => string[],
+    workerManager: WorkerManager
+  ): Promise<void> {
+    const data = typeof message === "string" ? message : message.toString();
+
+    try {
+      const parsed = JSON.parse(data);
+
+      // Check if this is a worker identifying itself
+      if (parsed.type === "identify" && parsed.workerId) {
+        const workerId = parsed.workerId as string;
+        // Move from clients to workers
+        this.bunClients.delete(ws);
+        this.bunWorkers.set(workerId, ws);
+        // Register the send callback for this worker
+        workerManager.registerWorkerSender(workerId, (msg: string) => {
+          ws.send(msg);
+        });
+        // Forward to worker manager
+        workerManager.handleMessage(data);
+        return;
+      }
+
+      // Check if this is a worker message
+      if (this.bunWorkers.has(parsed.workerId)) {
+        workerManager.handleMessage(data);
+        return;
+      }
+
+      // If it's from a worker (ready, result, error, crash messages)
+      if (parsed.type === "ready" || parsed.type === "result" || parsed.type === "error" || parsed.type === "crash") {
+        workerManager.handleMessage(data);
+        return;
+      }
+
+      // Otherwise treat as client message
+      if (this.bunClients.has(ws)) {
+        // Send welcome if this is the first message (client just connected)
+        if (!parsed.method) {
+          ws.send(JSON.stringify({
+            type: "welcome",
+            functions: availableFunctions(),
+          }));
+          return;
+        }
+
+        // Route the message
+        const response = await messageRouter.routeMessage(data, parsed.id);
+        ws.send(JSON.stringify(response));
+      }
+    } catch (error) {
+      console.error("Error handling WebSocket message:", error);
+    }
+  }
+
+  /**
+   * Handle Bun WebSocket close event
+   */
+  handleWebSocketClose(ws: ServerWebSocket<unknown>): void {
+    // Remove from clients
+    this.bunClients.delete(ws);
+
+    // Check if it was a worker
+    for (const [workerId, workerWs] of this.bunWorkers.entries()) {
+      if (workerWs === ws) {
+        this.bunWorkers.delete(workerId);
+        break;
+      }
+    }
   }
 
   /**

@@ -13,7 +13,7 @@ export class RpcClient {
     {
       resolve: (value: unknown) => void;
       reject: (error: Error) => void;
-      timeout: number;
+      timeout: ReturnType<typeof setTimeout>;
     }
   >();
   private callId = 0;

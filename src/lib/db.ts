@@ -1,35 +1,36 @@
 // Shared database utilities for lootbox SQLite database
 // Provides centralized connection management and schema initialization
 
-import { DB } from "https://deno.land/x/sqlite/mod.ts";
-import { join } from "jsr:@std/path";
+import { Database } from "bun:sqlite";
+import { join } from "path";
+import { mkdir } from "fs/promises";
 
 /**
  * Get platform-specific data directory following XDG Base Directory spec
  */
 function getDefaultDataDir(): string {
-  const platform = Deno.build.os;
+  const platform = process.platform;
 
-  if (platform === "windows") {
-    const appData = Deno.env.get("APPDATA") || Deno.env.get("USERPROFILE");
+  if (platform === "win32") {
+    const appData = process.env.APPDATA || process.env.USERPROFILE;
     return appData
       ? join(appData, "lootbox")
-      : join(Deno.cwd(), "lootbox-data");
+      : join(process.cwd(), "lootbox-data");
   } else if (platform === "darwin") {
-    const home = Deno.env.get("HOME");
+    const home = process.env.HOME;
     return home
       ? join(home, "Library", "Application Support", "lootbox")
-      : join(Deno.cwd(), "lootbox-data");
+      : join(process.cwd(), "lootbox-data");
   } else {
     // Linux/Unix - follow XDG spec
-    const xdgDataHome = Deno.env.get("XDG_DATA_HOME");
-    const home = Deno.env.get("HOME");
+    const xdgDataHome = process.env.XDG_DATA_HOME;
+    const home = process.env.HOME;
     if (xdgDataHome) {
       return join(xdgDataHome, "lootbox");
     } else if (home) {
       return join(home, ".local", "share", "lootbox");
     }
-    return join(Deno.cwd(), "lootbox-data");
+    return join(process.cwd(), "lootbox-data");
   }
 }
 
@@ -49,25 +50,26 @@ async function getDbPath(): Promise<string> {
 async function ensureDbDir(dbPath: string): Promise<void> {
   const dir = dbPath.substring(0, dbPath.lastIndexOf("/"));
   try {
-    await Deno.mkdir(dir, { recursive: true });
+    await mkdir(dir, { recursive: true });
   } catch (error) {
-    if (!(error instanceof Deno.errors.AlreadyExists)) {
+    const nodeError = error as NodeJS.ErrnoException;
+    if (nodeError.code !== "EEXIST") {
       throw error;
     }
   }
 }
 
-let dbInstance: DB | null = null;
+let dbInstance: Database | null = null;
 let schemaInitialized = false;
 
 /**
  * Initialize all database schemas
  */
-function initializeSchemas(db: DB): void {
+function initializeSchemas(db: Database): void {
   if (schemaInitialized) return;
 
   // Workflow events table
-  db.query(`
+  db.run(`
     CREATE TABLE IF NOT EXISTS workflow_events (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       timestamp INTEGER NOT NULL,
@@ -81,18 +83,18 @@ function initializeSchemas(db: DB): void {
     )
   `);
 
-  db.query(`
+  db.run(`
     CREATE INDEX IF NOT EXISTS idx_workflow_events_timestamp
     ON workflow_events(timestamp)
   `);
 
-  db.query(`
+  db.run(`
     CREATE INDEX IF NOT EXISTS idx_workflow_events_workflow_file
     ON workflow_events(workflow_file)
   `);
 
   // Script runs table
-  db.query(`
+  db.run(`
     CREATE TABLE IF NOT EXISTS script_runs (
       id TEXT PRIMARY KEY,
       timestamp INTEGER NOT NULL,
@@ -106,17 +108,17 @@ function initializeSchemas(db: DB): void {
     )
   `);
 
-  db.query(`
+  db.run(`
     CREATE INDEX IF NOT EXISTS idx_script_runs_timestamp
     ON script_runs(timestamp)
   `);
 
-  db.query(`
+  db.run(`
     CREATE INDEX IF NOT EXISTS idx_script_runs_session_id
     ON script_runs(session_id)
   `);
 
-  db.query(`
+  db.run(`
     CREATE INDEX IF NOT EXISTS idx_script_runs_success
     ON script_runs(success)
   `);
@@ -128,7 +130,7 @@ function initializeSchemas(db: DB): void {
  * Get or create database connection and initialize all schemas
  * This is a singleton - all modules share the same connection
  */
-export async function getDb(): Promise<DB> {
+export async function getDb(): Promise<Database> {
   if (dbInstance) {
     return dbInstance;
   }
@@ -136,7 +138,7 @@ export async function getDb(): Promise<DB> {
   const dbPath = await getDbPath();
   await ensureDbDir(dbPath);
 
-  dbInstance = new DB(dbPath);
+  dbInstance = new Database(dbPath);
   initializeSchemas(dbInstance);
 
   return dbInstance;

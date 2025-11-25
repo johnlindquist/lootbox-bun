@@ -1,4 +1,4 @@
-// Read version from deno.json
-import denoConfig from "../deno.json" with { type: "json" };
+// Read version from package.json
+import packageJson from "../package.json";
 
-export const VERSION = denoConfig.version;
+export const VERSION = packageJson.version;

@@ -40,7 +40,7 @@ export async function saveScriptRun(run: Omit<ScriptRun, "id">): Promise<void> {
         ? JSON.stringify(scriptRun.output)
         : null;
 
-      db.query(
+      db.run(
         `INSERT INTO script_runs (
           id, timestamp, script, success, output, error, duration_ms, session_id
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -63,6 +63,30 @@ export async function saveScriptRun(run: Omit<ScriptRun, "id">): Promise<void> {
   })();
 }
 
+interface ScriptRunRow {
+  id: string;
+  timestamp: number;
+  script: string;
+  success: number;
+  output: string | null;
+  error: string | null;
+  duration_ms: number | null;
+  session_id: string | null;
+}
+
+function rowToScriptRun(row: ScriptRunRow): ScriptRun {
+  return {
+    id: row.id,
+    timestamp: row.timestamp,
+    script: row.script,
+    success: row.success === 1,
+    output: row.output ? JSON.parse(row.output) : undefined,
+    error: row.error || undefined,
+    durationMs: row.duration_ms || undefined,
+    sessionId: row.session_id || undefined,
+  };
+}
+
 /**
  * Load all script runs from database
  * Returns sorted by timestamp (oldest first)
@@ -71,31 +95,13 @@ export async function loadScriptHistory(): Promise<ScriptRun[]> {
   try {
     const db = await getDb();
 
-    const results = db.queryEntries<{
-      id: string;
-      timestamp: number;
-      script: string;
-      success: number;
-      output: string | null;
-      error: string | null;
-      duration_ms: number | null;
-      session_id: string | null;
-    }>(
+    const results = db.query<ScriptRunRow, []>(
       `SELECT id, timestamp, script, success, output, error, duration_ms, session_id
        FROM script_runs
        ORDER BY timestamp ASC`
-    );
+    ).all();
 
-    return results.map((row) => ({
-      id: row.id,
-      timestamp: row.timestamp,
-      script: row.script,
-      success: row.success === 1,
-      output: row.output ? JSON.parse(row.output) : undefined,
-      error: row.error || undefined,
-      durationMs: row.duration_ms || undefined,
-      sessionId: row.session_id || undefined,
-    }));
+    return results.map(rowToScriptRun);
   } catch (error) {
     console.error("Failed to load script history:", error);
     return [];
@@ -109,33 +115,14 @@ export async function getRecentRuns(count: number): Promise<ScriptRun[]> {
   try {
     const db = await getDb();
 
-    const results = db.queryEntries<{
-      id: string;
-      timestamp: number;
-      script: string;
-      success: number;
-      output: string | null;
-      error: string | null;
-      duration_ms: number | null;
-      session_id: string | null;
-    }>(
+    const results = db.query<ScriptRunRow, [number]>(
       `SELECT id, timestamp, script, success, output, error, duration_ms, session_id
        FROM script_runs
        ORDER BY timestamp DESC
-       LIMIT ?`,
-      [count]
-    );
+       LIMIT ?`
+    ).all(count);
 
-    return results.map((row) => ({
-      id: row.id,
-      timestamp: row.timestamp,
-      script: row.script,
-      success: row.success === 1,
-      output: row.output ? JSON.parse(row.output) : undefined,
-      error: row.error || undefined,
-      durationMs: row.duration_ms || undefined,
-      sessionId: row.session_id || undefined,
-    }));
+    return results.map(rowToScriptRun);
   } catch (error) {
     console.error("Failed to get recent runs:", error);
     return [];
@@ -152,33 +139,14 @@ export async function getRunsInRange(
   try {
     const db = await getDb();
 
-    const results = db.queryEntries<{
-      id: string;
-      timestamp: number;
-      script: string;
-      success: number;
-      output: string | null;
-      error: string | null;
-      duration_ms: number | null;
-      session_id: string | null;
-    }>(
+    const results = db.query<ScriptRunRow, [number, number]>(
       `SELECT id, timestamp, script, success, output, error, duration_ms, session_id
        FROM script_runs
        WHERE timestamp >= ? AND timestamp <= ?
-       ORDER BY timestamp ASC`,
-      [startTime, endTime]
-    );
+       ORDER BY timestamp ASC`
+    ).all(startTime, endTime);
 
-    return results.map((row) => ({
-      id: row.id,
-      timestamp: row.timestamp,
-      script: row.script,
-      success: row.success === 1,
-      output: row.output ? JSON.parse(row.output) : undefined,
-      error: row.error || undefined,
-      durationMs: row.duration_ms || undefined,
-      sessionId: row.session_id || undefined,
-    }));
+    return results.map(rowToScriptRun);
   } catch (error) {
     console.error("Failed to get runs in range:", error);
     return [];
@@ -195,15 +163,14 @@ export async function cleanupOldRuns(keepDays: number): Promise<number> {
     const cutoffTime = Date.now() - keepDays * 24 * 60 * 60 * 1000;
 
     // Get count before deletion
-    const countBefore = db.queryEntries<{ count: number }>(
-      `SELECT COUNT(*) as count FROM script_runs WHERE timestamp < ?`,
-      [cutoffTime]
-    );
+    const countResult = db.query<{ count: number }, [number]>(
+      `SELECT COUNT(*) as count FROM script_runs WHERE timestamp < ?`
+    ).get(cutoffTime);
 
-    const deletedCount = countBefore[0]?.count || 0;
+    const deletedCount = countResult?.count || 0;
 
     if (deletedCount > 0) {
-      db.query(`DELETE FROM script_runs WHERE timestamp < ?`, [cutoffTime]);
+      db.run(`DELETE FROM script_runs WHERE timestamp < ?`, [cutoffTime]);
       console.error(`🧹 Cleaned up ${deletedCount} old script run(s)`);
     }
 
@@ -227,33 +194,14 @@ export async function loadRunsForDate(date: Date): Promise<ScriptRun[]> {
     const endOfDay = new Date(date);
     endOfDay.setHours(23, 59, 59, 999);
 
-    const results = db.queryEntries<{
-      id: string;
-      timestamp: number;
-      script: string;
-      success: number;
-      output: string | null;
-      error: string | null;
-      duration_ms: number | null;
-      session_id: string | null;
-    }>(
+    const results = db.query<ScriptRunRow, [number, number]>(
       `SELECT id, timestamp, script, success, output, error, duration_ms, session_id
        FROM script_runs
        WHERE timestamp >= ? AND timestamp <= ?
-       ORDER BY timestamp ASC`,
-      [startOfDay.getTime(), endOfDay.getTime()]
-    );
+       ORDER BY timestamp ASC`
+    ).all(startOfDay.getTime(), endOfDay.getTime());
 
-    return results.map((row) => ({
-      id: row.id,
-      timestamp: row.timestamp,
-      script: row.script,
-      success: row.success === 1,
-      output: row.output ? JSON.parse(row.output) : undefined,
-      error: row.error || undefined,
-      durationMs: row.duration_ms || undefined,
-      sessionId: row.session_id || undefined,
-    }));
+    return results.map(rowToScriptRun);
   } catch (error) {
     console.error(`Failed to load runs for ${date}:`, error);
     return [];
@@ -267,33 +215,14 @@ export async function getRunsBySession(sessionId: string): Promise<ScriptRun[]> 
   try {
     const db = await getDb();
 
-    const results = db.queryEntries<{
-      id: string;
-      timestamp: number;
-      script: string;
-      success: number;
-      output: string | null;
-      error: string | null;
-      duration_ms: number | null;
-      session_id: string | null;
-    }>(
+    const results = db.query<ScriptRunRow, [string]>(
       `SELECT id, timestamp, script, success, output, error, duration_ms, session_id
        FROM script_runs
        WHERE session_id = ?
-       ORDER BY timestamp ASC`,
-      [sessionId]
-    );
+       ORDER BY timestamp ASC`
+    ).all(sessionId);
 
-    return results.map((row) => ({
-      id: row.id,
-      timestamp: row.timestamp,
-      script: row.script,
-      success: row.success === 1,
-      output: row.output ? JSON.parse(row.output) : undefined,
-      error: row.error || undefined,
-      durationMs: row.duration_ms || undefined,
-      sessionId: row.session_id || undefined,
-    }));
+    return results.map(rowToScriptRun);
   } catch (error) {
     console.error(`Failed to get runs for session ${sessionId}:`, error);
     return [];

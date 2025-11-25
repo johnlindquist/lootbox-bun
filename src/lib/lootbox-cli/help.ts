@@ -73,9 +73,8 @@ Usage:
   lootbox server [OPTIONS]
 
 Execution Environment:
-  • Runtime: Deno sandbox with TypeScript support
+  • Runtime: Bun with TypeScript support
   • Network: fetch() available for HTTP requests
-  • Sandbox: Direct file system and environment access disabled
   • Timeout: 10 second execution limit
   • Global APIs: console, fetch, Promise, standard JavaScript/TypeScript APIs
 

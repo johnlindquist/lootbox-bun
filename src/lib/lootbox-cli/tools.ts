@@ -10,7 +10,7 @@ export async function toolsList(serverUrl: string): Promise<void> {
     const response = await fetch(`${httpUrl}/namespaces`);
     if (!response.ok) {
       console.error(`Error fetching namespaces: ${response.statusText}`);
-      Deno.exit(1);
+      process.exit(1);
     }
 
     const text = await response.text();
@@ -25,7 +25,7 @@ export async function toolsList(serverUrl: string): Promise<void> {
       "Error connecting to server:",
       error instanceof Error ? error.message : String(error)
     );
-    Deno.exit(1);
+    process.exit(1);
   }
 }
 
@@ -42,7 +42,7 @@ export async function toolsTypes(
     const response = await fetch(`${httpUrl}/types/${namespaces}`);
     if (!response.ok) {
       console.error(`Error fetching types: ${response.statusText}`);
-      Deno.exit(1);
+      process.exit(1);
     }
 
     const types = await response.text();
@@ -52,7 +52,7 @@ export async function toolsTypes(
       "Error connecting to server:",
       error instanceof Error ? error.message : String(error)
     );
-    Deno.exit(1);
+    process.exit(1);
   }
 }
 

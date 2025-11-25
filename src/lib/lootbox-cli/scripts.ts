@@ -1,5 +1,7 @@
 import { get_config } from "../get_config.ts";
-import { dirname } from "https://deno.land/std@0.208.0/path/mod.ts";
+import { dirname, join } from "path";
+import { stat, readdir, mkdir } from "fs/promises";
+import { existsSync } from "fs";
 
 interface ScriptMetadata {
   filename: string;
@@ -57,14 +59,15 @@ async function discoverScriptsInDir(dir: string): Promise<ScriptMetadata[]> {
   const scripts: ScriptMetadata[] = [];
 
   try {
-    const dirInfo = await Deno.stat(dir).catch(() => null);
-    if (!dirInfo?.isDirectory) return scripts;
+    const dirStat = await stat(dir).catch(() => null);
+    if (!dirStat?.isDirectory()) return scripts;
 
-    for await (const entry of Deno.readDir(dir)) {
-      if (entry.isFile && entry.name.endsWith('.ts')) {
-        const filePath = `${dir}/${entry.name}`;
+    const entries = await readdir(dir, { withFileTypes: true });
+    for (const entry of entries) {
+      if (entry.isFile() && entry.name.endsWith('.ts')) {
+        const filePath = join(dir, entry.name);
         try {
-          const content = await Deno.readTextFile(filePath);
+          const content = await Bun.file(filePath).text();
           const { description, examples } = parseJSDoc(content);
 
           scripts.push({
@@ -76,9 +79,9 @@ async function discoverScriptsInDir(dir: string): Promise<ScriptMetadata[]> {
         } catch (err) {
           console.error(`Failed to read ${filePath}:`, err);
         }
-      } else if (entry.isDirectory) {
+      } else if (entry.isDirectory()) {
         // Recursively scan subdirectories
-        const subScripts = await discoverScriptsInDir(`${dir}/${entry.name}`);
+        const subScripts = await discoverScriptsInDir(join(dir, entry.name));
         scripts.push(...subScripts.map(s => ({
           ...s,
           filename: `${entry.name}/${s.filename}`,
@@ -165,15 +168,12 @@ export async function scriptsInit(filename: string): Promise<void> {
 
   // Auto-add .ts extension if not present
   const scriptName = filename.endsWith('.ts') ? filename : `${filename}.ts`;
-  const scriptPath = `${config.scripts_dir}/${scriptName}`;
+  const scriptPath = join(config.scripts_dir, scriptName);
 
   // Check if file already exists
-  try {
-    await Deno.stat(scriptPath);
+  if (existsSync(scriptPath)) {
     console.error(`Error: Script '${scriptName}' already exists at ${scriptPath}`);
-    Deno.exit(1);
-  } catch {
-    // File doesn't exist, good to proceed
+    process.exit(1);
   }
 
   const template = `/**
@@ -186,9 +186,9 @@ export async function scriptsInit(filename: string): Promise<void> {
 
   // Create parent directories if they don't exist
   const parentDir = dirname(scriptPath);
-  await Deno.mkdir(parentDir, { recursive: true });
+  await mkdir(parentDir, { recursive: true });
 
-  await Deno.writeTextFile(scriptPath, template);
+  await Bun.write(scriptPath, template);
   console.log(`✓ Created ${scriptPath}`);
   console.log(`\nEdit the script and run with: lootbox ${scriptName}`);
 }

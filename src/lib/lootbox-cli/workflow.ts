@@ -1,7 +1,9 @@
-import { HandlebarsJS } from "https://deno.land/x/handlebars/mod.ts";
-import { parse as parseYaml } from "jsr:@std/yaml@^1.0.0";
+import Handlebars from "handlebars";
+import { parse as parseYaml } from "yaml";
 import { generateSessionId, logWorkflowEvent } from "../workflow_log.ts";
 import type { FlowState } from "./types.ts";
+import { existsSync } from "fs";
+import { unlink } from "fs/promises";
 
 const STATE_FILE = ".lootbox-workflow.json";
 
@@ -25,16 +27,16 @@ interface TemplateContext {
 }
 
 // Register Handlebars helpers
-HandlebarsJS.registerHelper("eq", (a: unknown, b: unknown) => a === b);
-HandlebarsJS.registerHelper("ne", (a: unknown, b: unknown) => a !== b);
-HandlebarsJS.registerHelper("lt", (a: number, b: number) => a < b);
-HandlebarsJS.registerHelper("gt", (a: number, b: number) => a > b);
-HandlebarsJS.registerHelper("lte", (a: number, b: number) => a <= b);
-HandlebarsJS.registerHelper("gte", (a: number, b: number) => a >= b);
+Handlebars.registerHelper("eq", (a: unknown, b: unknown) => a === b);
+Handlebars.registerHelper("ne", (a: unknown, b: unknown) => a !== b);
+Handlebars.registerHelper("lt", (a: number, b: number) => a < b);
+Handlebars.registerHelper("gt", (a: number, b: number) => a > b);
+Handlebars.registerHelper("lte", (a: number, b: number) => a <= b);
+Handlebars.registerHelper("gte", (a: number, b: number) => a >= b);
 
 export async function loadWorkflowState(): Promise<FlowState | null> {
   try {
-    const stateText = await Deno.readTextFile(STATE_FILE);
+    const stateText = await Bun.file(STATE_FILE).text();
     const state = JSON.parse(stateText);
     currentSessionId = state.sessionId || null;
     return state;
@@ -44,12 +46,12 @@ export async function loadWorkflowState(): Promise<FlowState | null> {
 }
 
 export async function saveWorkflowState(state: FlowState): Promise<void> {
-  await Deno.writeTextFile(STATE_FILE, JSON.stringify(state, null, 2));
+  await Bun.write(STATE_FILE, JSON.stringify(state, null, 2));
 }
 
 export async function deleteWorkflowState(): Promise<void> {
   try {
-    await Deno.remove(STATE_FILE);
+    await unlink(STATE_FILE);
   } catch {
     // Ignore if file doesn't exist
   }
@@ -76,13 +78,13 @@ async function displayStep(
   endLoop = false,
   endLoopReason?: string
 ): Promise<void> {
-  const content = await Deno.readTextFile(state.file);
+  const content = await Bun.file(state.file).text();
   const steps = parseWorkflowFile(content);
 
   if (state.section >= steps.length) {
     console.log("Workflow complete! All steps have been shown.");
     await deleteWorkflowState();
-    Deno.exit(0);
+    process.exit(0);
   }
 
   const step = steps[state.section];
@@ -100,8 +102,8 @@ async function displayStep(
   }
 
   // Render title and prompt through Handlebars
-  const titleTemplate = HandlebarsJS.compile(step.title);
-  const promptTemplate = HandlebarsJS.compile(step.prompt);
+  const titleTemplate = Handlebars.compile(step.title);
+  const promptTemplate = Handlebars.compile(step.prompt);
   const renderedTitle = titleTemplate(context);
   const renderedPrompt = promptTemplate(context);
 
@@ -146,28 +148,26 @@ async function displayStep(
 
 async function resolveWorkflowPath(file: string): Promise<string> {
   // Try the path as-is first
-  try {
-    await Deno.stat(file);
+  if (existsSync(file)) {
     return file;
-  } catch {
-    // If not found, try in workflows directory
-    const { get_config } = await import("../get_config.ts");
-    const config = await get_config();
-    const fallbackPath = `${config.workflows_dir}/${file}`;
-    try {
-      await Deno.stat(fallbackPath);
-      return fallbackPath;
-    } catch {
-      // Return original path so error message is accurate
-      return file;
-    }
   }
+
+  // If not found, try in workflows directory
+  const { get_config } = await import("../get_config.ts");
+  const config = await get_config();
+  const fallbackPath = `${config.workflows_dir}/${file}`;
+  if (existsSync(fallbackPath)) {
+    return fallbackPath;
+  }
+
+  // Return original path so error message is accurate
+  return file;
 }
 
 export async function workflowStart(file: string): Promise<void> {
   const resolvedPath = await resolveWorkflowPath(file);
   try {
-    const content = await Deno.readTextFile(resolvedPath);
+    const content = await Bun.file(resolvedPath).text();
     const steps = parseWorkflowFile(content);
 
     if (steps.length === 0) {
@@ -175,7 +175,7 @@ export async function workflowStart(file: string): Promise<void> {
       console.error(
         "Workflow files should have a 'steps' array with at least one step"
       );
-      Deno.exit(1);
+      process.exit(1);
     }
 
     // Generate new session ID
@@ -206,7 +206,7 @@ export async function workflowStart(file: string): Promise<void> {
       `Error reading file '${resolvedPath}':`,
       error instanceof Error ? error.message : String(error)
     );
-    Deno.exit(1);
+    process.exit(1);
   }
 }
 
@@ -215,11 +215,11 @@ export async function workflowStep(endLoopReason?: string): Promise<void> {
   if (!state) {
     console.error("Error: No active workflow");
     console.error("Start a workflow with: lootbox workflow start <file>");
-    Deno.exit(1);
+    process.exit(1);
   }
 
   try {
-    const content = await Deno.readTextFile(state.file);
+    const content = await Bun.file(state.file).text();
     const steps = parseWorkflowFile(content);
 
     if (state.section >= steps.length) {
@@ -237,7 +237,7 @@ export async function workflowStep(endLoopReason?: string): Promise<void> {
       });
 
       await deleteWorkflowState();
-      Deno.exit(0);
+      process.exit(0);
     }
 
     const step = steps[state.section];
@@ -247,14 +247,14 @@ export async function workflowStep(endLoopReason?: string): Promise<void> {
     if (endLoopReason !== undefined) {
       if (!step.loop) {
         console.error("Error: Current step is not a loop");
-        Deno.exit(1);
+        process.exit(1);
       }
 
       if (iteration < step.loop.min) {
         console.error(
           `Error: Cannot end loop. Minimum ${step.loop.min} iterations required (currently at ${iteration})`
         );
-        Deno.exit(1);
+        process.exit(1);
       }
 
       // Log end_loop event
@@ -336,7 +336,7 @@ export async function workflowStep(endLoopReason?: string): Promise<void> {
       `Error reading workflow file '${state.file}':`,
       error instanceof Error ? error.message : String(error)
     );
-    Deno.exit(1);
+    process.exit(1);
   }
 }
 
@@ -344,7 +344,7 @@ export async function workflowReset(): Promise<void> {
   const state = await loadWorkflowState();
   if (!state) {
     console.error("Error: No active workflow");
-    Deno.exit(1);
+    process.exit(1);
   }
 
   // Log reset event
@@ -371,7 +371,7 @@ export async function workflowStatus(): Promise<void> {
   }
 
   try {
-    const content = await Deno.readTextFile(state.file);
+    const content = await Bun.file(state.file).text();
     const steps = parseWorkflowFile(content);
     console.log(`Active workflow: ${state.file}`);
     console.log(`Current step: ${state.section + 1}/${steps.length}`);
@@ -391,7 +391,7 @@ export async function workflowStatus(): Promise<void> {
       `Error reading workflow file '${state.file}':`,
       error instanceof Error ? error.message : String(error)
     );
-    Deno.exit(1);
+    process.exit(1);
   }
 }
 
@@ -399,7 +399,7 @@ export async function workflowAbort(reason: string): Promise<void> {
   const state = await loadWorkflowState();
   if (!state) {
     console.error("Error: No active workflow");
-    Deno.exit(1);
+    process.exit(1);
   }
 
   // Log abort event

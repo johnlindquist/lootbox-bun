@@ -1,6 +1,6 @@
-import { parseArgs } from "@std/cli";
-import { Spinner } from "@std/cli/unstable-spinner";
-import { get_config } from "../get_config.ts";
+import minimist from "minimist";
+import ora from "ora";
+import { get_config, setArgsOverride, clearArgsOverride } from "../get_config.ts";
 import { WebSocketRpcServer } from "../rpc/websocket_server.ts";
 
 /**
@@ -12,7 +12,7 @@ function sanitizeServerName(name: string): string {
 }
 
 export async function startServer(args: string[]): Promise<void> {
-  const parsedArgs = parseArgs(args, {
+  const parsedArgs = minimist(args, {
     string: ["port", "lootbox-root", "lootbox-data-dir"],
     alias: {
       p: "port",
@@ -22,13 +22,12 @@ export async function startServer(args: string[]): Promise<void> {
   });
 
   // Override config with CLI args if provided
-  const originalArgs = Deno.args;
   if (
     parsedArgs.port ||
     parsedArgs["lootbox-root"] ||
     parsedArgs["lootbox-data-dir"]
   ) {
-    const customArgs = [];
+    const customArgs: string[] = [];
     if (parsedArgs.port) {
       customArgs.push("--port", String(parsedArgs.port));
     }
@@ -41,21 +40,20 @@ export async function startServer(args: string[]): Promise<void> {
         parsedArgs["lootbox-data-dir"] as string
       );
     }
-    // Temporarily replace Deno.args for get_config
-    Object.defineProperty(Deno, "args", { value: customArgs, writable: true });
+    // Set args override for get_config
+    setArgsOverride(customArgs);
   }
 
   try {
-    const spinner = new Spinner({
-      message: "Starting lootbox 🎁",
+    const spinner = ora({
+      text: "Starting lootbox 🎁",
       color: "cyan",
-    });
-    spinner.start();
+    }).start();
 
     const config = await get_config();
 
     // Process MCP servers from config
-    let mcpConfig = null;
+    let mcpConfig: { mcpServers: Record<string, { command: string; args: string[]; env?: Record<string, string> }> } | null = null;
     if (config.mcp_servers && Object.keys(config.mcp_servers).length > 0) {
       // Sanitize server names and filter out mcp-rpc-bridge
       const sanitizedServers: Record<
@@ -75,12 +73,9 @@ export async function startServer(args: string[]): Promise<void> {
     await server.start(config.port, mcpConfig, spinner);
   } catch (error) {
     console.error("Failed to start server:", error);
-    Deno.exit(1);
+    process.exit(1);
   } finally {
-    // Restore original args
-    Object.defineProperty(Deno, "args", {
-      value: originalArgs,
-      writable: true,
-    });
+    // Clear args override
+    clearArgsOverride();
   }
 }

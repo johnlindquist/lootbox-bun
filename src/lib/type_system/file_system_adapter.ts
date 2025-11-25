@@ -1,6 +1,8 @@
 // File system abstraction layer for testability
 
 import type { RpcFileInfo } from "./types.ts";
+import { stat, readdir, realpath, watch } from "fs/promises";
+import { join } from "path";
 
 export interface FileSystemAdapter {
   discoverRpcFiles(directory: string): Promise<RpcFileInfo[]>;
@@ -8,23 +10,24 @@ export interface FileSystemAdapter {
   watchFiles?(directory: string, callback: (files: RpcFileInfo[]) => void): void;
 }
 
-export class DenoFileSystemAdapter implements FileSystemAdapter {
+export class BunFileSystemAdapter implements FileSystemAdapter {
   async discoverRpcFiles(directory: string): Promise<RpcFileInfo[]> {
     const files: RpcFileInfo[] = [];
 
     try {
-      const dirInfo = await Deno.stat(directory).catch(() => null);
-      if (!dirInfo?.isDirectory) {
+      const dirStat = await stat(directory).catch(() => null);
+      if (!dirStat?.isDirectory()) {
         console.error(`RPC directory not found: ${directory}`);
         return [];
       }
 
-      for await (const entry of Deno.readDir(directory)) {
-        if (entry.isFile && entry.name.endsWith(".ts")) {
-          const filePath = `${directory}/${entry.name}`;
-          const absolutePath = await Deno.realPath(filePath);
+      const entries = await readdir(directory, { withFileTypes: true });
+      for (const entry of entries) {
+        if (entry.isFile() && entry.name.endsWith(".ts")) {
+          const filePath = join(directory, entry.name);
+          const absolutePath = await realpath(filePath);
           const name = entry.name.replace(".ts", "");
-          const stats = await Deno.stat(absolutePath);
+          const stats = await stat(absolutePath);
 
           files.push({
             name,
@@ -44,7 +47,7 @@ export class DenoFileSystemAdapter implements FileSystemAdapter {
 
   async readFile(path: string): Promise<string> {
     try {
-      return await Deno.readTextFile(path);
+      return await Bun.file(path).text();
     } catch (error) {
       throw new Error(`Failed to read file ${path}: ${error}`);
     }
@@ -52,9 +55,9 @@ export class DenoFileSystemAdapter implements FileSystemAdapter {
 
   async watchFiles(directory: string, callback: (files: RpcFileInfo[]) => void): Promise<void> {
     try {
-      const watcher = Deno.watchFs(directory);
+      const watcher = watch(directory, { recursive: true });
       for await (const event of watcher) {
-        if (event.kind === "modify" && event.paths.some((p) => p.endsWith(".ts"))) {
+        if (event.filename?.endsWith(".ts")) {
           const files = await this.discoverRpcFiles(directory);
           callback(files);
         }
@@ -64,6 +67,9 @@ export class DenoFileSystemAdapter implements FileSystemAdapter {
     }
   }
 }
+
+// Keep the old name as alias for backwards compatibility
+export const DenoFileSystemAdapter = BunFileSystemAdapter;
 
 export class MockFileSystemAdapter implements FileSystemAdapter {
   private files = new Map<string, string>();

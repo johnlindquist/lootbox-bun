@@ -56,9 +56,9 @@ export class McpClientManager {
         command: config.command,
         args: config.args,
         env: {
-          ...Deno.env.toObject(),
+          ...process.env,
           ...config.env,
-        },
+        } as Record<string, string>,
       });
 
       const client = new Client(

@@ -5,13 +5,14 @@
  * In production: Serves static files from ui/dist
  */
 
-import { serveStatic } from "@hono/hono/deno";
-import type { Hono } from "@hono/hono";
+import { serveStatic } from "hono/bun";
+import type { Hono } from "hono";
 import type { OpenAPIHono } from "@hono/zod-openapi";
+import { stat } from "fs/promises";
 
 export function setupUIRoutes(app: OpenAPIHono) {
-  const isDev = Deno.env.get("MODE") === "development";
-  const vitePort = Deno.env.get("VITE_PORT") || "5173";
+  const isDev = process.env.MODE === "development";
+  const vitePort = process.env.VITE_PORT || "5173";
 
   if (isDev) {
     // Root UI route (must come before /ui/*)
@@ -23,7 +24,7 @@ export function setupUIRoutes(app: OpenAPIHono) {
         return c.html(body);
       } catch (error) {
         console.error("[UI] Proxy error:", error);
-        return c.text("UI dev server not running. Start it with: deno task ui:dev", 503);
+        return c.text("UI dev server not running. Start it with: bun run ui:dev", 503);
       }
     });
 
@@ -53,7 +54,7 @@ export function setupUIRoutes(app: OpenAPIHono) {
         }
       } catch (error) {
         console.error("[UI] Proxy error:", error);
-        return c.text("UI dev server not running. Start it with: deno task ui:dev", 503);
+        return c.text("UI dev server not running. Start it with: bun run ui:dev", 503);
       }
     });
   } else {
@@ -70,8 +71,8 @@ export function setupUIRoutes(app: OpenAPIHono) {
 
       // Check if the requested file exists
       try {
-        const stat = await Deno.stat(filePath);
-        if (stat.isFile) {
+        const fileStat = await stat(filePath);
+        if (fileStat.isFile()) {
           // File exists, serve it
           const staticHandler = serveStatic({
             root: "./ui/dist",

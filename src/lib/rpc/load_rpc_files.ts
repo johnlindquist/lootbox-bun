@@ -2,6 +2,8 @@
 
 import { get_config } from "../get_config.ts";
 import { getUserLootboxToolsDir } from "../paths.ts";
+import { stat, readdir, realpath } from "fs/promises";
+import { join } from "path";
 
 export interface RpcFile {
   name: string;
@@ -14,15 +16,16 @@ async function discoverToolsInDir(
   const tools = new Map<string, string>();
 
   try {
-    const dirInfo = await Deno.stat(toolsDir).catch(() => null);
-    if (!dirInfo?.isDirectory) {
+    const dirStat = await stat(toolsDir).catch(() => null);
+    if (!dirStat?.isDirectory()) {
       return tools;
     }
 
-    for await (const entry of Deno.readDir(toolsDir)) {
-      if (entry.isFile && entry.name.endsWith(".ts")) {
-        const filePath = `${toolsDir}/${entry.name}`;
-        const absolutePath = await Deno.realPath(filePath);
+    const entries = await readdir(toolsDir, { withFileTypes: true });
+    for (const entry of entries) {
+      if (entry.isFile() && entry.name.endsWith(".ts")) {
+        const filePath = join(toolsDir, entry.name);
+        const absolutePath = await realpath(filePath);
         const name = entry.name.replace(".ts", "");
         tools.set(name, absolutePath);
       }
@@ -72,7 +75,7 @@ export const generate_types = async (): Promise<string> => {
 
   const extractor = new TypeExtractor();
   const generator = new ClientGenerator();
-  const extractionResults = [];
+  const extractionResults: ReturnType<InstanceType<typeof TypeExtractor>["extractFromFile"]>[] = [];
 
   for (const file of files) {
     const result = extractor.extractFromFile(file.path);

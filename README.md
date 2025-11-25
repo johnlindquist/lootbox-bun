@@ -1,4 +1,6 @@
-# Lootbox - Code Mode for LLMs
+# Lootbox-Bun - Code Mode for LLMs
+
+> **This is a Bun port of [jx-codes/lootbox](https://github.com/jx-codes/lootbox)**. Full credit goes to the original author for the concept and implementation. This fork converts the project from Deno to Bun runtime.
 
 Code mode doesn't replace MCP - it orchestrates it.
 
@@ -6,7 +8,7 @@ Example: Fetch Jira issues, filter high-priority, store in KV
 - MCP: 4 sequential tool calls
 - Code mode: 1 script that calls 4 tools
 
-The script is reusable. Now you have a "get-high-priority-jira" 
+The script is reusable. Now you have a "get-high-priority-jira"
 tool. It's tools all the way up.
 
 That's what Lootbox does.
@@ -26,23 +28,15 @@ https://blog.cloudflare.com/code-mode/
 
 ## Prerequisites
 
-- [Deno 2.x](https://deno.com/) or later
+- [Bun](https://bun.sh/) v1.0 or later
 - Git (for cloning the repository)
 
 ## Quick Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/jx-codes/lootbox/main/install.sh | bash
-```
-
-This installs `lootbox` to `~/.deno/bin/`.
-
-Or build from source:
-
-```bash
-git clone https://github.com/jx-codes/lootbox
-cd lootbox
-deno task compile
+git clone https://github.com/johnlindquist/lootbox-bun
+cd lootbox-bun
+bun install
 ```
 
 ## Quick Start
@@ -50,13 +44,13 @@ deno task compile
 ### 1. Start Server
 
 ```bash
-lootbox server
+bun run src/lootbox-cli.ts server
 ```
 
 ### 2. Initialize Project
 
 ```bash
-lootbox init  # Creates .lootbox/ in current directory
+bun run src/lootbox-cli.ts init  # Creates .lootbox/ in current directory
 ```
 
 The server starts with:
@@ -69,13 +63,13 @@ The server starts with:
 
 ```bash
 # List all available tool namespaces
-lootbox tools
+bun run src/lootbox-cli.ts tools
 
 # Get TypeScript type definitions for specific namespaces
-lootbox tools types kv,sqlite,memory
+bun run src/lootbox-cli.ts tools types kv,sqlite,memory
 
 # List available scripts with examples
-lootbox scripts
+bun run src/lootbox-cli.ts scripts
 ```
 
 ### 4. Create Your Tools
@@ -97,14 +91,42 @@ export async function processData(args: {
 
 ```bash
 # Execute inline code
-lootbox exec 'console.log(await tools.kv.get({key: "test"}))'
+bun run src/lootbox-cli.ts exec 'console.log(await tools.kv.get({key: "test"}))'
 
 # Execute from file
-lootbox script.ts
+bun run src/lootbox-cli.ts script.ts
 
 # Execute from stdin
-cat script.ts | lootbox
+cat script.ts | bun run src/lootbox-cli.ts
 ```
+
+## MCP Bridge for Claude Code
+
+Lootbox-Bun includes an MCP bridge that exposes your tools to Claude Code:
+
+### Setup
+
+1. Start the lootbox server:
+```bash
+bun run src/lootbox-cli.ts server --port 3456
+```
+
+2. Add to your Claude Code MCP settings (`~/.claude/claude_desktop_config.json` or similar):
+```json
+{
+  "mcpServers": {
+    "lootbox": {
+      "command": "bun",
+      "args": ["run", "/path/to/lootbox-bun/mcp-bridge.ts"],
+      "env": {
+        "LOOTBOX_URL": "ws://localhost:3456/ws"
+      }
+    }
+  }
+}
+```
+
+3. Your lootbox tools will now be available in Claude Code with the format `namespace__function` (e.g., `basic_memory__write_memory`).
 
 ## Example Tools
 
@@ -112,43 +134,19 @@ The repository includes example tools that demonstrate common use cases. You can
 
 **Location in Repository**: `.lootbox/tools/`
 
-**To use**: Copy the desired tool files from the repository's `.lootbox/tools/` directory to your project's `.lootbox/tools/` directory.
+### Basic Memory Tool
 
-### Usage Example (After Copying Tools)
+The included `basic_memory.ts` tool wraps the [basic-memory](https://github.com/basicmemory/basic-memory) CLI:
 
 ```typescript
-// Using example tools (after copying to your .lootbox/tools/)
-const kvResult = await tools.kv.set({
-  key: "user:1",
-  value: { name: "Alice" },
-});
-const userData = await tools.kv.get({ key: "user:1" });
-
-// SQLite queries
-await tools.sqlite.execute({
-  sql: "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)",
-});
-await tools.sqlite.query({
-  sql: "SELECT * FROM users WHERE name = ?",
-  params: ["Alice"],
-});
-
-// Knowledge graph
-await tools.memory.createEntities({
-  entities: [
-    { name: "Alice", type: "person", properties: { age: 30 } },
-    { name: "Bob", type: "person", properties: { age: 25 } },
-  ],
-});
-await tools.memory.createRelations({
-  relations: [{ from: "Alice", to: "Bob", type: "knows" }],
-});
-
-// GraphQL
-const result = await tools.graphql.query({
-  endpoint: "https://api.example.com/graphql",
-  query: "{ user(id: 1) { name email } }",
-});
+// Available functions:
+await tools.basic_memory.write_memory({ title: "Meeting Notes", content: "..." })
+await tools.basic_memory.read_memory({ permalink: "meeting-notes" })
+await tools.basic_memory.search_memories({ query: "meeting", limit: 10 })
+await tools.basic_memory.list_memories({ folder: "work" })
+await tools.basic_memory.delete_memory({ permalink: "old-note" })
+await tools.basic_memory.sync_memories({})
+await tools.basic_memory.memory_status({})
 ```
 
 ## Script Management
@@ -163,7 +161,7 @@ Scripts are stored in `.lootbox/scripts/` and can be organized in subdirectories
 
 ```bash
 # Create a new script from template
-lootbox scripts init process-data
+bun run src/lootbox-cli.ts scripts init process-data
 
 # This creates .lootbox/scripts/process-data.ts with template
 ```
@@ -175,8 +173,8 @@ Scripts support JSDoc comments for documentation and examples:
 ```typescript
 /**
  * Process and format tags from JSON input
- * @example echo '{"tags": ["typescript", "deno"]}' | lootbox memory/tags.ts
- * @example echo '{"tags": ["a", "b"], "filter": "a"}' | lootbox memory/tags.ts
+ * @example echo '{"tags": ["typescript", "bun"]}' | bun run src/lootbox-cli.ts memory/tags.ts
+ * @example echo '{"tags": ["a", "b"], "filter": "a"}' | bun run src/lootbox-cli.ts memory/tags.ts
  */
 
 const input = stdin().json();
@@ -196,17 +194,17 @@ console.log(JSON.stringify(result, null, 2));
 
 ### Running Scripts
 
-Use `lootbox scripts` to list all available scripts with descriptions and examples from JSDoc.
+Use `bun run src/lootbox-cli.ts scripts` to list all available scripts with descriptions and examples from JSDoc.
 
 ```bash
 # Scripts auto-resolve from .lootbox/scripts/
-lootbox process-data.ts
+bun run src/lootbox-cli.ts process-data.ts
 
 # Subdirectories work too
-lootbox memory/tags.ts
+bun run src/lootbox-cli.ts memory/tags.ts
 
 # Pipe data to scripts
-echo '{"tags": ["a", "b"]}' | lootbox memory/tags.ts
+echo '{"tags": ["a", "b"]}' | bun run src/lootbox-cli.ts memory/tags.ts
 ```
 
 ### stdin() Helper
@@ -277,29 +275,29 @@ Create `lootbox.config.json` in your project directory:
 
 ### Execution
 
-- `lootbox script.ts` - Execute TypeScript file
-- `lootbox -e 'code'` or `lootbox exec 'code'` - Execute inline code
-- `cat script.ts | lootbox` - Execute from stdin
+- `bun run src/lootbox-cli.ts script.ts` - Execute TypeScript file
+- `bun run src/lootbox-cli.ts exec 'code'` - Execute inline code
+- `cat script.ts | bun run src/lootbox-cli.ts` - Execute from stdin
 
 ### Tools & Scripts Discovery
 
-- `lootbox tools` - List all tool namespaces (local + MCP)
-- `lootbox tools types <namespaces>` - Get TypeScript types (comma-separated)
-- `lootbox scripts` - List available scripts with examples
-- `lootbox scripts init <name>` - Create new script from template
+- `bun run src/lootbox-cli.ts tools` - List all tool namespaces (local + MCP)
+- `bun run src/lootbox-cli.ts tools types <namespaces>` - Get TypeScript types (comma-separated)
+- `bun run src/lootbox-cli.ts scripts` - List available scripts with examples
+- `bun run src/lootbox-cli.ts scripts init <name>` - Create new script from template
 
 ### Server & Init
 
-- `lootbox server` - Start server (default port 3000)
-- `lootbox server --port <port> --lootbox-root <dir> --lootbox-data-dir <dir>` - Start with custom settings
-- `lootbox init` - Create `.lootbox/` directory structure
+- `bun run src/lootbox-cli.ts server` - Start server (default port 3000)
+- `bun run src/lootbox-cli.ts server --port <port> --lootbox-root <dir> --lootbox-data-dir <dir>` - Start with custom settings
+- `bun run src/lootbox-cli.ts init` - Create `.lootbox/` directory structure
 
 ### Help
 
-- `lootbox --help` - Human-friendly help
-- `lootbox --llm-help` - LLM-focused command reference
-- `lootbox --config-help` - Configuration documentation
-- `lootbox --version` - Show version number
+- `bun run src/lootbox-cli.ts --help` - Human-friendly help
+- `bun run src/lootbox-cli.ts --llm-help` - LLM-focused command reference
+- `bun run src/lootbox-cli.ts --config-help` - Configuration documentation
+- `bun run src/lootbox-cli.ts --version` - Show version number
 
 ## MCP Server Integration
 
@@ -345,7 +343,7 @@ await tools.mcp_github.create_issue({
 
 ### Discovery
 
-MCP server namespaces appear alongside local tools when running `lootbox tools`, prefixed with `mcp_` (e.g., `mcp_filesystem`, `mcp_github`).
+MCP server namespaces appear alongside local tools when running `bun run src/lootbox-cli.ts tools`, prefixed with `mcp_` (e.g., `mcp_filesystem`, `mcp_github`).
 
 ## Workflows
 
@@ -353,12 +351,12 @@ Execute multi-step workflows with Handlebars templating, loops, and session trac
 
 **Commands:**
 
-- `lootbox workflow start <file>` - Start workflow
-- `lootbox workflow step` - Execute/show current step
-- `lootbox workflow step --end-loop="reason"` - End loop early (after min iterations)
-- `lootbox workflow status` - Check current position
-- `lootbox workflow reset` - Reset to beginning
-- `lootbox workflow abort --abort="reason"` - Abort with reason
+- `bun run src/lootbox-cli.ts workflow start <file>` - Start workflow
+- `bun run src/lootbox-cli.ts workflow step` - Execute/show current step
+- `bun run src/lootbox-cli.ts workflow step --end-loop="reason"` - End loop early (after min iterations)
+- `bun run src/lootbox-cli.ts workflow status` - Check current position
+- `bun run src/lootbox-cli.ts workflow reset` - Reset to beginning
+- `bun run src/lootbox-cli.ts workflow abort --abort="reason"` - Abort with reason
 
 ### Workflow File Format (YAML)
 
@@ -443,7 +441,7 @@ Each workflow run has a unique session ID for tracking workflow events:
 - Session ID generated on `workflow start`
 - Persisted in `.lootbox-workflow.json` state file
 - Used for workflow logging and analytics
-- Visible with `lootbox workflow status`
+- Visible with `bun run src/lootbox-cli.ts workflow status`
 
 ### Workflow State
 
@@ -510,8 +508,6 @@ export function wrongSignature(x: number, y: string) {}
 - Handle errors with clear error messages
 - Return structured objects, not primitives
 
-See the "Example Tools" section above for reference implementations (kv, sqlite, memory, graphql).
-
 ## HTTP API Endpoints
 
 | Endpoint             | Method | Description                                       |
@@ -551,8 +547,8 @@ curl http://localhost:3000/health
 Development mode enables hot-reloading and debugging:
 
 ```bash
-# Start server in development mode (MODE=development)
-deno task start
+# Start server in development mode
+bun run src/lootbox-cli.ts server
 
 # This enables:
 # - Automatic restarts on file changes
@@ -563,37 +559,24 @@ deno task start
 ### Building
 
 ```bash
-# Build UI (required before compile)
-deno task ui:build
+# Install dependencies
+bun install
 
-# Compile standalone binary
-deno task compile
+# Build UI (if applicable)
+bun run ui:build
 
-# UI development server
-deno task ui:dev
-
-# UI preview mode
-deno task ui:preview
+# Run directly
+bun run src/lootbox-cli.ts server
 ```
 
 ### Code Quality
 
 ```bash
-# Format code
-deno task fmt
+# Type check
+bun run typecheck
 
-# Lint code
-deno task lint
-```
-
-### Production Mode
-
-```bash
-# Start in production mode (no auto-reload)
-deno task start:prod
-
-# Or run compiled binary
-./lootbox server
+# Or use tsc directly
+bunx tsc --noEmit
 ```
 
 ## Architecture
@@ -623,8 +606,8 @@ deno task start:prod
 
 ### Script Sandboxing
 
-- **Isolated Execution**: User scripts run in separate Deno processes
-- **Limited Permissions**: Scripts only have `--allow-net` access
+- **Isolated Execution**: User scripts run in separate Bun processes
+- **Limited Permissions**: Scripts only have network access
 - **10-Second Timeout**: Automatic termination for long-running scripts
 - **Injected Client**: `tools` object automatically available
 
@@ -639,12 +622,16 @@ deno task start:prod
 
 **Local-First Design**: Lootbox runs on your local machine in trusted environments.
 
-- **Tool Functions**: Run with `--allow-all` - only include trusted code
-- **User Scripts**: Sandboxed with `--allow-net` only
+- **Tool Functions**: Run with full access - only include trusted code
+- **User Scripts**: Sandboxed with network access only
 - **No Authentication**: Designed for localhost use
 - **MCP Servers**: External processes with configurable permissions
 
-## Inspiration
+## Credits
+
+This project is a Bun port of the original [lootbox](https://github.com/jx-codes/lootbox) by [jx-codes](https://github.com/jx-codes). The original implementation was built for Deno and this fork converts it to use the Bun runtime.
+
+### Original Inspiration
 
 This project implements ideas from:
 

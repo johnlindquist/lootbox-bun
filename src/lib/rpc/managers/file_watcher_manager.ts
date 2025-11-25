@@ -9,8 +9,10 @@
  * - Lifecycle control (start/stop watching)
  */
 
+import { watch, type FSWatcher } from "fs";
+
 export class FileWatcherManager {
-  private watcher: Deno.FsWatcher | null = null;
+  private watcher: FSWatcher | null = null;
   private watching = false;
 
   /**
@@ -27,27 +29,25 @@ export class FileWatcherManager {
     }
 
     try {
-      this.watcher = Deno.watchFs(directory);
+      this.watcher = watch(directory, { recursive: true }, async (eventType, filename) => {
+        if (!this.watching) return;
+
+        // Only react to TypeScript file changes
+        if (filename?.endsWith(".ts")) {
+          // Debounce rapid file changes
+          await new Promise((resolve) => setTimeout(resolve, 100));
+          await onChange();
+        }
+      });
+
       this.watching = true;
 
-      // Start watching in background
-      (async () => {
-        try {
-          for await (const event of this.watcher!) {
-            // Only react to TypeScript file changes
-            if (event.paths.some((path) => path.endsWith(".ts"))) {
-              // Debounce rapid file changes
-              await new Promise((resolve) => setTimeout(resolve, 100));
-              await onChange();
-            }
-          }
-        } catch (err) {
-          if (this.watching) {
-            // Only log if we didn't intentionally stop watching
-            console.error("File watcher error:", err);
-          }
+      this.watcher.on("error", (err) => {
+        if (this.watching) {
+          // Only log if we didn't intentionally stop watching
+          console.error("File watcher error:", err);
         }
-      })();
+      });
     } catch (err) {
       console.error("Failed to start file watcher:", err);
       this.watching = false;
@@ -64,9 +64,10 @@ export class FileWatcherManager {
 
     this.watching = false;
 
-    // Note: Deno.FsWatcher doesn't have a direct close method,
-    // but setting watcher to null will allow garbage collection
-    this.watcher = null;
+    if (this.watcher) {
+      this.watcher.close();
+      this.watcher = null;
+    }
   }
 
   /**

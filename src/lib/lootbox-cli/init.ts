@@ -1,3 +1,6 @@
+import { existsSync } from "fs";
+import { mkdir } from "fs/promises";
+
 export async function init(): Promise<void> {
   const lootboxDir = ".lootbox";
   const configFile = "lootbox.config.json";
@@ -5,31 +8,25 @@ export async function init(): Promise<void> {
   // Check for existing files/directories
   const conflicts: string[] = [];
 
-  try {
-    await Deno.stat(lootboxDir);
+  if (existsSync(lootboxDir)) {
     conflicts.push(lootboxDir);
-  } catch {
-    // Doesn't exist, good
   }
 
-  try {
-    await Deno.stat(configFile);
+  if (existsSync(configFile)) {
     conflicts.push(configFile);
-  } catch {
-    // Doesn't exist, good
   }
 
   if (conflicts.length > 0) {
     console.error("Error: The following files/directories already exist:");
     conflicts.forEach((c) => console.error(`  - ${c}`));
     console.error("\nPlease remove them or run init in a different directory.");
-    Deno.exit(1);
+    process.exit(1);
   }
 
   // Create directory structure
-  await Deno.mkdir(`${lootboxDir}/tools`, { recursive: true });
-  await Deno.mkdir(`${lootboxDir}/workflows`, { recursive: true });
-  await Deno.mkdir(`${lootboxDir}/scripts`, { recursive: true });
+  await mkdir(`${lootboxDir}/tools`, { recursive: true });
+  await mkdir(`${lootboxDir}/workflows`, { recursive: true });
+  await mkdir(`${lootboxDir}/scripts`, { recursive: true });
 
   // Create config file with defaults
   const defaultConfig = {
@@ -37,7 +34,7 @@ export async function init(): Promise<void> {
     lootboxRoot: ".lootbox",
   };
 
-  await Deno.writeTextFile(
+  await Bun.write(
     configFile,
     JSON.stringify(defaultConfig, null, 2) + "\n"
   );

@@ -112,7 +112,7 @@ export class McpSchemaFetcher {
         originalName: resource.name,
         description: resource.description,
         uri: resource.uri,
-        uriTemplate: resource.uriTemplate as string | undefined,
+        uriTemplate: (resource as { uriTemplate?: string }).uriTemplate,
         mimeType: resource.mimeType,
       }));
     } catch (error) {
