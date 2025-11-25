@@ -112,20 +112,23 @@ export async function search_memories(args: {
 
 /**
  * Get recent activity across the knowledge base
- * @param args.page_size - Maximum number of items (default: 10)
+ * @param args.page_size - Not used (kept for API compatibility). recent-activity uses --depth and --timeframe
  */
 export async function list_memories(args: {
   page_size?: number;
 }): Promise<{ success: boolean; memories?: string; error?: string }> {
-  const { page_size = 10 } = args;
-
-  const cmdArgs = ["recent-activity", "--page-size", String(page_size)];
-  const result = await runBasicMemoryTool(cmdArgs);
-
-  if (result.success) {
-    return { success: true, memories: result.output };
+  // recent-activity doesn't have --page-size or --project flags
+  // It uses --depth (default: 1) and --timeframe (default: 7d)
+  try {
+    const result = await $`basic-memory tool recent-activity --depth 3 --timeframe 30d`.quiet();
+    return { success: true, memories: result.text() };
+  } catch (error) {
+    const err = error as { stderr?: { toString(): string }; message?: string };
+    return {
+      success: false,
+      error: err.stderr?.toString() || err.message || String(error)
+    };
   }
-  return { success: false, error: result.error };
 }
 
 /**
