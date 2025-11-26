@@ -55,14 +55,6 @@ export interface PaginationOptions {
 }
 
 /**
- * MCP session information
- */
-export interface McpSession {
-  id: string;
-  expiresAt: number;
-}
-
-/**
  * Standard error extraction from various error types
  */
 export function extractErrorMessage(error: unknown): string {
