@@ -19,7 +19,7 @@ const LOOTBOX_HTTP = LOOTBOX_URL.replace("ws://", "http://").replace("wss://", "
 interface RpcFunction {
   name: string;
   namespace: string;
-  properties: Record<string, { type: string }>;
+  properties: Record<string, { type: string; items?: { type: string } }>;
   required: string[];
 }
 
@@ -179,22 +179,29 @@ async function fetchFunctions(): Promise<RpcFunction[]> {
         // Check if we hit the closing brace of args
         if (line.includes("})")) {
           // Parse the collected args
-          const properties: Record<string, { type: string }> = {};
+          const properties: Record<string, { type: string; items?: { type: string } }> = {};
           const required: string[] = [];
 
-          const propRegex = /(\w+)(\?)?:\s*(\w+)/g;
+          // Updated regex to capture array types like string[] or number[]
+          const propRegex = /(\w+)(\?)?:\s*(\w+)(\[\])?/g;
           let propMatch;
 
           while ((propMatch = propRegex.exec(argsContent)) !== null) {
             const propName = propMatch[1];
             const isOptional = propMatch[2] === "?";
             const propType = propMatch[3];
+            const isArray = propMatch[4] === "[]";
 
             let jsonType = "string";
             if (propType === "number") jsonType = "number";
             else if (propType === "boolean") jsonType = "boolean";
 
-            properties[propName] = { type: jsonType };
+            // Handle array types properly for JSON Schema
+            if (isArray) {
+              properties[propName] = { type: "array", items: { type: jsonType } };
+            } else {
+              properties[propName] = { type: jsonType };
+            }
 
             if (!isOptional) {
               required.push(propName);
