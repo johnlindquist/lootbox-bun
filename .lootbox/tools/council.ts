@@ -29,31 +29,154 @@ function sendProgress(message: string): void {
 }
 
 // Agent configuration with their smartest models
+// All agents use streaming output to provide continuous progress updates
 const AGENTS = {
   claude: {
     name: "Claude (Opus ultrathink)",
     command: "claude",
-    // Use opus model with ultrathink for maximum reasoning
-    args: ["-p", "--model", "opus", "--append-system-prompt", "ultrathink"],
+    // Use opus model with ultrathink, stream-json for continuous output
+    args: ["-p", "--model", "opus", "--append-system-prompt", "ultrathink", "--output-format", "stream-json"],
     description: "Anthropic's most capable model with extended thinking enabled",
+    parseOutput: "stream-json", // Parse stream-json format
   },
   codex: {
     name: "Codex (GPT-5.1-Codex-Max)",
     command: "codex",
-    // Use exec mode for non-interactive, with xhigh reasoning
-    args: ["exec", "-m", "gpt-5.1-codex-max", "-c", 'model_reasoning_effort="xhigh"'],
+    // Use exec mode with --json for JSONL streaming output
+    args: ["exec", "-m", "gpt-5.1-codex-max", "-c", 'model_reasoning_effort="xhigh"', "--json"],
     description: "OpenAI's top coding model with maximum reasoning effort",
+    parseOutput: "jsonl", // Parse JSONL format
   },
   gemini: {
     name: "Gemini (Pro)",
     command: "gemini",
-    // Use pro model with text output
-    args: ["-m", "pro", "-o", "text"],
+    // Use pro model with stream-json for continuous output
+    args: ["-m", "pro", "-o", "stream-json"],
     description: "Google's strongest reasoning model with 1M context window",
+    parseOutput: "stream-json", // Parse stream-json format
   },
 } as const;
 
 type AgentName = keyof typeof AGENTS;
+type ParseOutputType = typeof AGENTS[AgentName]["parseOutput"];
+
+/**
+ * Parse streaming JSON output from Claude CLI (stream-json format)
+ * Each line is a JSON object with type and content
+ */
+function parseClaudeStreamJson(rawOutput: string): string {
+  const lines = rawOutput.split("\n").filter((line) => line.trim());
+  const textParts: string[] = [];
+
+  for (const line of lines) {
+    try {
+      const obj = JSON.parse(line);
+      // Claude stream-json has different message types
+      if (obj.type === "assistant" && obj.message?.content) {
+        for (const block of obj.message.content) {
+          if (block.type === "text") {
+            textParts.push(block.text);
+          }
+        }
+      } else if (obj.type === "content_block_delta" && obj.delta?.text) {
+        textParts.push(obj.delta.text);
+      } else if (obj.type === "result" && obj.result) {
+        // Final result message
+        textParts.push(obj.result);
+      }
+    } catch {
+      // Not JSON, might be plain text fallback
+      if (line.trim() && !line.startsWith("{")) {
+        textParts.push(line);
+      }
+    }
+  }
+
+  return textParts.join("") || rawOutput;
+}
+
+/**
+ * Parse JSONL output from Codex CLI
+ * Each line is a JSON event object
+ */
+function parseCodexJsonl(rawOutput: string): string {
+  const lines = rawOutput.split("\n").filter((line) => line.trim());
+  const textParts: string[] = [];
+
+  for (const line of lines) {
+    try {
+      const obj = JSON.parse(line);
+      // Codex JSONL has events with different types
+      if (obj.type === "message" && obj.content) {
+        textParts.push(obj.content);
+      } else if (obj.type === "agent_message" && obj.message) {
+        textParts.push(obj.message);
+      } else if (obj.message) {
+        textParts.push(obj.message);
+      } else if (obj.content) {
+        textParts.push(obj.content);
+      } else if (obj.text) {
+        textParts.push(obj.text);
+      }
+    } catch {
+      // Not JSON, might be plain text
+      if (line.trim() && !line.startsWith("{")) {
+        textParts.push(line);
+      }
+    }
+  }
+
+  return textParts.join("\n") || rawOutput;
+}
+
+/**
+ * Parse streaming JSON output from Gemini CLI
+ */
+function parseGeminiStreamJson(rawOutput: string): string {
+  const lines = rawOutput.split("\n").filter((line) => line.trim());
+  const textParts: string[] = [];
+
+  for (const line of lines) {
+    try {
+      const obj = JSON.parse(line);
+      // Gemini stream-json format
+      if (obj.text) {
+        textParts.push(obj.text);
+      } else if (obj.content) {
+        textParts.push(obj.content);
+      } else if (obj.message) {
+        textParts.push(obj.message);
+      } else if (obj.type === "text" && obj.data) {
+        textParts.push(obj.data);
+      }
+    } catch {
+      // Not JSON, might be plain text
+      if (line.trim() && !line.startsWith("{")) {
+        textParts.push(line);
+      }
+    }
+  }
+
+  return textParts.join("") || rawOutput;
+}
+
+/**
+ * Parse output based on agent's output format
+ */
+function parseAgentOutput(rawOutput: string, parseType: ParseOutputType): string {
+  switch (parseType) {
+    case "stream-json": {
+      // Try Claude format first, then Gemini
+      const claudeParsed = parseClaudeStreamJson(rawOutput);
+      if (claudeParsed !== rawOutput) return claudeParsed;
+      return parseGeminiStreamJson(rawOutput);
+    }
+    case "jsonl":
+      return parseCodexJsonl(rawOutput);
+    default:
+      return rawOutput;
+  }
+}
 
 interface AgentResponse {
   agent: string;
@@ -107,7 +230,7 @@ async function queryAgent(
     // Stream stdout and collect response while sending progress
     let response = "";
     let charCount = 0;
-    const progressInterval = 5000; // Send progress every 5 seconds
+    const progressInterval = 3000; // Send progress every 3 seconds (more frequent to avoid RPC timeout)
 
     // Read stdout in chunks for streaming progress
     const reader = proc.stdout.getReader();
@@ -127,14 +250,23 @@ async function queryAgent(
 
     resetTimeout();
 
-    // Progress reporter that runs periodically
+    // Progress reporter that runs periodically - CRITICAL for keeping RPC alive
+    // Uses setInterval which runs independently of the read() blocking call
+    let progressCount = 0;
     const progressReporter = setInterval(() => {
+      progressCount++;
       const elapsed = Math.round((Date.now() - startTime) / 1000);
+      const status = charCount === 0 ? "waiting for response" : `${charCount} chars received`;
       const preview = response.length > 100
         ? `...${response.slice(-100).replace(/\n/g, " ")}`
         : response.replace(/\n/g, " ");
-      sendProgress(`[${agent.name}] ${elapsed}s elapsed, ${charCount} chars received${preview ? `: "${preview.slice(0, 50)}..."` : ""}`);
+      const progressMsg = `[${agent.name}] ${elapsed}s elapsed, ${status}${preview ? `: "${preview.slice(0, 50)}..."` : ""}`;
+      sendProgress(progressMsg);
+      log.debug(`Progress #${progressCount}: ${progressMsg}`);
     }, progressInterval);
+
+    // Send immediate "waiting" progress to ensure RPC knows we're alive
+    sendProgress(`[${agent.name}] Spawned process, waiting for model response...`);
 
     try {
       while (true) {
@@ -179,15 +311,16 @@ async function queryAgent(
       };
     }
 
-    const trimmedResponse = response.trim();
-    log.success(agent.name, trimmedResponse.substring(0, 200));
+    // Parse the streaming output to extract the actual text content
+    const parsedResponse = parseAgentOutput(response.trim(), agent.parseOutput);
+    log.success(agent.name, parsedResponse.substring(0, 200));
     sendProgress(`[${agent.name}] Completed in ${(duration_ms / 1000).toFixed(1)}s (${charCount} chars)`);
 
     return {
       agent: agent.name,
       model: agentKey,
       success: true,
-      response: trimmedResponse,
+      response: parsedResponse,
       duration_ms,
     };
   } catch (error) {
@@ -242,7 +375,7 @@ export async function ask(args: {
   // Query all agents in parallel
   const responsePromises = agents.map((agentKey) => {
     if (!(agentKey in AGENTS)) {
-      return Promise.resolve({
+      return Promise.resolve<AgentResponse>({
         agent: agentKey,
         model: agentKey,
         success: false,
