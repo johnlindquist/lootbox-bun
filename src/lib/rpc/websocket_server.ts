@@ -25,6 +25,7 @@ import { ConnectionManager } from "./managers/connection_manager.ts";
 import { OpenApiRouteHandler } from "./managers/openapi_route_handler.ts";
 import { setupUIRoutes } from "../ui_server.ts";
 import { showBootup } from "../lootbox-cli/bootup.ts";
+import { getHealthMonitor } from "./managers/health_monitor.ts";
 
 export class WebSocketRpcServer {
   private app = new OpenAPIHono();
@@ -200,6 +201,10 @@ export class WebSocketRpcServer {
         return honoFetch(req, server);
       },
       websocket: {
+        // DEBUG: Testing WebSocket options to fix CPU spin
+        idleTimeout: 0, // Disable idle timeout to prevent keep-alive polling
+        perMessageDeflate: false, // Disable compression
+        sendPings: false, // Disable automatic pings
         open(ws) {
           connectionManager.handleWebSocketOpen(ws);
         },
@@ -221,16 +226,19 @@ export class WebSocketRpcServer {
     // Give server time to start
     await new Promise((resolve) => setTimeout(resolve, 100));
 
-    // Phase 9: Initialize workers
+    // Phase 9: Initialize workers for all RPC files
     const uniqueFiles = this.rpcCacheManager.getUniqueFiles();
-    await Promise.all(
-      Array.from(uniqueFiles.values()).map((file) =>
-        this.workerManager!.startWorker(file)
-      )
-    );
+    for (const file of uniqueFiles.values()) {
+      await this.workerManager!.startWorker(file);
+    }
+    console.error(`[Server] Started ${uniqueFiles.size} workers`);
 
     // Wait for workers to be ready
     await this.workerManager.waitForReady(5000);
+
+    // Phase 10: Start health monitoring
+    const healthMonitor = getHealthMonitor();
+    healthMonitor.start();
 
     // Show bootup display
     showBootup({
@@ -247,6 +255,9 @@ export class WebSocketRpcServer {
    */
   async stop(): Promise<void> {
     console.error("Stopping RPC server...");
+
+    // Stop health monitoring
+    getHealthMonitor().stop();
 
     // Stop workers
     if (this.workerManager) {

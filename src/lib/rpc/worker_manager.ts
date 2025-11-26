@@ -6,10 +6,10 @@ import { join } from "path";
 import { randomUUID } from "crypto";
 import type { Subprocess } from "bun";
 
-// Inline worker code to avoid path resolution issues in compiled binaries
+// Inline worker code using IPC (not WebSocket) to avoid CPU spinning bug
 const RPC_WORKER_CODE = `
 // RPC Worker - Long-running process that executes RPC functions
-// One worker per RPC file, communicates with main server via WebSocket
+// Communicates with main server via Bun IPC (process.send/process.on)
 
 interface CallMessage {
   type: "call";
@@ -25,155 +25,100 @@ interface ShutdownMessage {
 type WorkerMessage = CallMessage | ShutdownMessage;
 
 async function main() {
-  // Parse CLI arguments (Bun uses process.argv)
   const rpcFilePath = process.argv[2];
-  const workerWsUrl = process.argv[3];
-  const namespace = process.argv[4];
+  const namespace = process.argv[3];
 
-  if (!rpcFilePath || !workerWsUrl || !namespace) {
-    console.error("Usage: rpc_worker.ts <rpcFilePath> <workerWsUrl> <namespace>");
+  if (!rpcFilePath || !namespace) {
+    console.error("Usage: worker <rpcFilePath> <namespace>");
     process.exit(1);
   }
 
   // Import all functions from RPC file
   const functions = await import(rpcFilePath);
 
-  // Connect to main server
-  const ws = new WebSocket(workerWsUrl);
+  // Signal ready via IPC
+  process.send?.({
+    type: "ready",
+    workerId: namespace,
+  });
 
-  ws.onopen = () => {
-    // Identify ourselves
-    ws.send(JSON.stringify({
-      type: "identify",
-      workerId: namespace,
-    }));
+  // Handle IPC messages from parent
+  process.on("message", async (msg: WorkerMessage) => {
+    if (msg.type === "call") {
+      const { id, functionName, args } = msg;
 
-    // Signal ready
-    ws.send(JSON.stringify({
-      type: "ready",
-      workerId: namespace,
-    }));
-  };
+      try {
+        const fn = functions[functionName];
 
-  ws.onmessage = async (event) => {
-    try {
-      const msg: WorkerMessage = JSON.parse(
-        typeof event.data === "string"
-          ? event.data
-          : new TextDecoder().decode(new Uint8Array(event.data as ArrayBuffer))
-      );
-
-      if (msg.type === "call") {
-        const { id, functionName, args } = msg;
-
-        try {
-          // Get the function
-          const fn = functions[functionName];
-
-          if (typeof fn !== "function") {
-            throw new Error(\`Function '\${functionName}' not found or not exported\`);
-          }
-
-          // Set up progress callback if the module supports it
-          // This allows long-running functions to send progress updates
-          if (typeof functions.setProgressCallback === "function") {
-            functions.setProgressCallback((message: string) => {
-              ws.send(JSON.stringify({
-                type: "progress",
-                id,
-                message,
-              }));
-            });
-          }
-
-          // Execute with extended timeout (5 minutes for streaming operations)
-          const timeoutPromise = new Promise((_, reject) => {
-            setTimeout(() => reject(new Error("Function execution timeout (5m)")), 300000);
-          });
-
-          const result = await Promise.race([
-            fn(args),
-            timeoutPromise,
-          ]);
-
-          // Clear progress callback
-          if (typeof functions.setProgressCallback === "function") {
-            functions.setProgressCallback(null);
-          }
-
-          // Send result back
-          ws.send(JSON.stringify({
-            type: "result",
-            id,
-            data: result,
-          }));
-        } catch (error) {
-          // Clear progress callback on error
-          if (typeof functions.setProgressCallback === "function") {
-            functions.setProgressCallback(null);
-          }
-
-          // Send error back
-          ws.send(JSON.stringify({
-            type: "error",
-            id,
-            error: error instanceof Error ? error.message : String(error),
-          }));
+        if (typeof fn !== "function") {
+          throw new Error(\`Function '\${functionName}' not found or not exported\`);
         }
-      } else if (msg.type === "shutdown") {
-        console.error(\`[Worker \${namespace}] Received shutdown signal\`);
-        ws.close();
-        process.exit(0);
+
+        // Set up progress callback if the module supports it
+        if (typeof functions.setProgressCallback === "function") {
+          functions.setProgressCallback((message: string) => {
+            process.send?.({
+              type: "progress",
+              id,
+              message,
+            });
+          });
+        }
+
+        // Execute with extended timeout (5 minutes)
+        const timeoutPromise = new Promise((_, reject) => {
+          setTimeout(() => reject(new Error("Function execution timeout (5m)")), 300000);
+        });
+
+        const result = await Promise.race([
+          fn(args),
+          timeoutPromise,
+        ]);
+
+        // Clear progress callback
+        if (typeof functions.setProgressCallback === "function") {
+          functions.setProgressCallback(null);
+        }
+
+        // Send result back via IPC
+        process.send?.({
+          type: "result",
+          id,
+          data: result,
+        });
+      } catch (error) {
+        if (typeof functions.setProgressCallback === "function") {
+          functions.setProgressCallback(null);
+        }
+
+        process.send?.({
+          type: "error",
+          id,
+          error: error instanceof Error ? error.message : String(error),
+        });
       }
-    } catch (error) {
-      console.error(\`[Worker \${namespace}] Error handling message:\`, error);
+    } else if (msg.type === "shutdown") {
+      console.error(\`[Worker \${namespace}] Received shutdown signal\`);
+      process.exit(0);
     }
-  };
-
-  ws.onerror = (error) => {
-    // Suppress "Unexpected EOF" errors on shutdown
-    const errorEvent = error as ErrorEvent;
-    if (!errorEvent.message?.includes("Unexpected EOF")) {
-      console.error(\`[Worker \${namespace}] WebSocket error:\`, error);
-    }
-  };
-
-  ws.onclose = () => {
-    // Silent exit on close
-    process.exit(0);
-  };
+  });
 
   // Handle uncaught errors
   process.on("uncaughtException", (error) => {
     console.error(\`[Worker \${namespace}] Uncaught error:\`, error);
-
-    try {
-      ws.send(JSON.stringify({
-        type: "crash",
-        error: error?.message || String(error),
-      }));
-    } catch {
-      // Best effort
-    }
-
-    ws.close();
+    process.send?.({
+      type: "crash",
+      error: error?.message || String(error),
+    });
     process.exit(1);
   });
 
-  // Handle unhandled promise rejections
   process.on("unhandledRejection", (reason) => {
     console.error(\`[Worker \${namespace}] Unhandled rejection:\`, reason);
-
-    try {
-      ws.send(JSON.stringify({
-        type: "crash",
-        error: (reason as Error)?.message || String(reason),
-      }));
-    } catch {
-      // Best effort
-    }
-
-    ws.close();
+    process.send?.({
+      type: "crash",
+      error: (reason as Error)?.message || String(reason),
+    });
     process.exit(1);
   });
 }
@@ -186,7 +131,6 @@ type ProgressCallback = (callId: string, message: string) => void;
 
 interface WorkerState {
   process: Subprocess;
-  sendMessage?: (message: string) => void; // Callback to send messages to worker
   workerId: string;
   filePath: string;
   status: "starting" | "ready" | "crashed" | "failed";
@@ -202,11 +146,6 @@ interface WorkerState {
   restartCount: number;
   lastRestart: number;
   everReady: boolean; // Track if worker ever successfully started
-}
-
-interface IdentifyMessage {
-  type: "identify";
-  workerId: string;
 }
 
 interface ReadyMessage {
@@ -238,7 +177,6 @@ interface ProgressMessage {
 }
 
 type WorkerIncomingMessage =
-  | IdentifyMessage
   | ReadyMessage
   | ResultMessage
   | ErrorMessage
@@ -263,6 +201,56 @@ export class WorkerManager {
   }
 
   /**
+   * Handle IPC message from worker
+   */
+  private handleIPCMessage(workerId: string, message: unknown): void {
+    const msg = message as WorkerIncomingMessage;
+    const worker = this.workers.get(workerId);
+
+    if (!worker) {
+      console.error(`[WorkerManager] Unknown worker: ${workerId}`);
+      return;
+    }
+
+    if (msg.type === "ready") {
+      worker.status = "ready";
+      worker.everReady = true;
+    } else if (msg.type === "result") {
+      const pending = worker.pendingCalls.get(msg.id);
+      if (pending) {
+        clearTimeout(pending.timeoutId);
+        pending.resolve(msg.data);
+        worker.pendingCalls.delete(msg.id);
+      }
+    } else if (msg.type === "error") {
+      const pending = worker.pendingCalls.get(msg.id);
+      if (pending) {
+        clearTimeout(pending.timeoutId);
+        pending.reject(new Error(msg.error));
+        worker.pendingCalls.delete(msg.id);
+      }
+    } else if (msg.type === "progress") {
+      const pending = worker.pendingCalls.get(msg.id);
+      if (pending) {
+        // Reset timeout on progress
+        clearTimeout(pending.timeoutId);
+        pending.timeoutId = setTimeout(() => {
+          worker.pendingCalls.delete(msg.id);
+          pending.reject(new Error(`RPC call timeout after progress (no update for 60s)`));
+        }, 60000);
+
+        // Forward progress to client
+        if (this.progressCallback && pending.clientCallId) {
+          this.progressCallback(pending.clientCallId, msg.message);
+        }
+      }
+    } else if (msg.type === "crash") {
+      console.error(`[WorkerManager] Worker ${workerId} crashed: ${msg.error}`);
+      this.handleWorkerCrash(workerId);
+    }
+  }
+
+  /**
    * Start a worker process for an RPC file
    */
   async startWorker(file: RpcFile): Promise<void> {
@@ -272,11 +260,14 @@ export class WorkerManager {
     const tempFile = join(tmpdir(), `lootbox_worker_${randomUUID()}.ts`);
     await Bun.write(tempFile, RPC_WORKER_CODE);
 
-    // Spawn worker process using Bun
-    const workerWsUrl = `ws://localhost:${this.port}/worker-ws`;
-    const proc = Bun.spawn(["bun", "run", tempFile, file.path, workerWsUrl, workerId], {
-      stdout: "pipe",
-      stderr: "inherit", // Show worker logs in main process
+    // Spawn worker process using Bun IPC (not WebSocket to avoid CPU spinning bug)
+    const proc = Bun.spawn(["bun", "run", tempFile, file.path, workerId], {
+      stdout: "ignore",
+      stderr: "inherit",
+      ipc: (message) => {
+        // Handle IPC messages from worker
+        this.handleIPCMessage(workerId, message);
+      },
     });
 
     // Create worker state
@@ -293,7 +284,7 @@ export class WorkerManager {
 
     this.workers.set(workerId, worker);
 
-    // Monitor process exit
+    // Monitor process exit for crash handling
     proc.exited.then((exitCode) => {
       if (exitCode !== 0) {
         console.error(
@@ -302,109 +293,6 @@ export class WorkerManager {
         this.handleWorkerCrash(workerId);
       }
     });
-  }
-
-  /**
-   * Register a send callback for a worker
-   */
-  registerWorkerSender(
-    workerId: string,
-    sendMessage: (message: string) => void
-  ): void {
-    const worker = this.workers.get(workerId);
-    if (worker) {
-      worker.sendMessage = sendMessage;
-    }
-  }
-
-  /**
-   * Handle incoming message from worker
-   */
-  handleMessage(data: string): void {
-    try {
-      const msg: WorkerIncomingMessage = JSON.parse(data);
-
-      if (msg.type === "identify") {
-        const workerId = msg.workerId;
-        const worker = this.workers.get(workerId);
-
-        if (!worker) {
-          console.error(
-            `[WorkerManager] Unknown worker identified: ${workerId}`
-          );
-          return;
-        }
-
-      } else if (msg.type === "ready") {
-        const workerId = msg.workerId;
-        const worker = this.workers.get(workerId);
-
-        if (worker) {
-          worker.status = "ready";
-          worker.everReady = true;
-        }
-      } else if (msg.type === "result") {
-        // Find worker by searching for the pending call
-        for (const worker of this.workers.values()) {
-          const pending = worker.pendingCalls.get(msg.id);
-          if (pending) {
-            clearTimeout(pending.timeoutId);
-            pending.resolve(msg.data);
-            worker.pendingCalls.delete(msg.id);
-            return;
-          }
-        }
-      } else if (msg.type === "error") {
-        // Find worker by searching for the pending call
-        for (const worker of this.workers.values()) {
-          const pending = worker.pendingCalls.get(msg.id);
-          if (pending) {
-            clearTimeout(pending.timeoutId);
-            pending.reject(new Error(msg.error));
-            worker.pendingCalls.delete(msg.id);
-            return;
-          }
-        }
-      } else if (msg.type === "progress") {
-        // Progress message - reset the timeout for the pending call
-        // This allows long-running operations to continue without timing out
-        for (const worker of this.workers.values()) {
-          const pending = worker.pendingCalls.get(msg.id);
-          if (pending) {
-            // Clear the old timeout and set a new one
-            clearTimeout(pending.timeoutId);
-            pending.timeoutId = setTimeout(() => {
-              worker.pendingCalls.delete(msg.id);
-              pending.reject(
-                new Error(`RPC call timeout after progress (no update for 60s)`)
-              );
-            }, 60000); // 60 second timeout after each progress update
-
-            // Forward progress to client using the original client call ID
-            if (this.progressCallback && pending.clientCallId) {
-              this.progressCallback(pending.clientCallId, msg.message);
-            }
-            return;
-          }
-        }
-      } else if (msg.type === "crash") {
-        // Find worker - we need to track which worker sent this
-        // For now, log and let process monitoring handle it
-        console.error(`[WorkerManager] Worker crashed: ${msg.error}`);
-      }
-    } catch (error) {
-      console.error(`[WorkerManager] Error handling message:`, error);
-    }
-  }
-
-  /**
-   * Handle worker disconnection
-   */
-  handleDisconnect(workerId: string): void {
-    const worker = this.workers.get(workerId);
-    if (worker) {
-      worker.sendMessage = undefined;
-    }
   }
 
   /**
@@ -438,12 +326,6 @@ export class WorkerManager {
       );
     }
 
-    if (!worker.sendMessage) {
-      throw new Error(
-        `Worker for namespace '${namespace}' has no send callback`
-      );
-    }
-
     // Generate unique call ID
     const callId = `call_${Date.now()}_${Math.random()
       .toString(36)
@@ -464,15 +346,13 @@ export class WorkerManager {
       worker.pendingCalls.set(callId, { resolve, reject, timeoutId, clientCallId });
     });
 
-    // Send call message
-    worker.sendMessage(
-      JSON.stringify({
-        type: "call",
-        id: callId,
-        functionName,
-        args,
-      })
-    );
+    // Send call message via IPC
+    worker.process.send({
+      type: "call",
+      id: callId,
+      functionName,
+      args,
+    });
 
     return resultPromise;
   }
@@ -528,15 +408,13 @@ export class WorkerManager {
 
     console.error(`[WorkerManager] Stopping worker ${workerId}`);
 
-    if (worker.sendMessage) {
-      try {
-        worker.sendMessage(JSON.stringify({ type: "shutdown" }));
-      } catch {
-        // Best effort
-      }
-
+    // Send shutdown via IPC
+    try {
+      worker.process.send({ type: "shutdown" });
       // Wait a bit for graceful shutdown
       await new Promise((resolve) => setTimeout(resolve, 500));
+    } catch {
+      // Best effort
     }
 
     // Force kill if still alive
@@ -553,8 +431,6 @@ export class WorkerManager {
     }
     worker.pendingCalls.clear();
 
-    // Clean up
-    worker.sendMessage = undefined;
     this.workers.delete(workerId);
   }
 
@@ -607,12 +483,11 @@ export class WorkerManager {
    */
   async stopAllWorkers(): Promise<void> {
     for (const worker of this.workers.values()) {
-      if (worker.sendMessage) {
-        try {
-          worker.sendMessage(JSON.stringify({ type: "shutdown" }));
-        } catch {
-          // Best effort
-        }
+      // Send shutdown via IPC
+      try {
+        worker.process.send({ type: "shutdown" });
+      } catch {
+        // Best effort
       }
 
       try {
