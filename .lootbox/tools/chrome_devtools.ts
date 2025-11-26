@@ -6,43 +6,10 @@
  */
 
 import { spawn, ChildProcess } from "node:child_process";
-import { appendFileSync, mkdirSync, existsSync } from "node:fs";
-import { join } from "node:path";
+import { createLogger, extractErrorMessage } from "./shared/index.ts";
 
-// Logging utilities - writes to file on disk
-const LOG_DIR = join(process.env.HOME || "/tmp", ".lootbox-logs");
-const LOG_FILE = join(LOG_DIR, "chrome_devtools.log");
-
-// Helper to append log (creates dir if needed)
-const writeLog = async (level: string, message: string) => {
-  try {
-    if (!existsSync(LOG_DIR)) {
-      mkdirSync(LOG_DIR, { recursive: true });
-    }
-    const timestamp = new Date().toISOString();
-    const line = `[${timestamp}] [${level}] ${message}\n`;
-    appendFileSync(LOG_FILE, line);
-  } catch (e) {
-    // Silent fail if logging fails
-  }
-};
-
-const logCall = async (fn: string, args: Record<string, unknown>) => {
-  await writeLog("CALL", `📞 ${fn}(${JSON.stringify(args)})`);
-};
-const logSuccess = async (fn: string, result: unknown) => {
-  const preview =
-    typeof result === "string"
-      ? result.substring(0, 200) + (result.length > 200 ? "..." : "")
-      : JSON.stringify(result).substring(0, 200);
-  await writeLog("SUCCESS", `✅ ${fn} → ${preview}`);
-};
-const logError = async (fn: string, error: string) => {
-  await writeLog("ERROR", `❌ ${fn} → ${error}`);
-};
-const logInfo = async (message: string) => {
-  await writeLog("INFO", `ℹ️ ${message}`);
-};
+// Create logger for this tool
+const log = createLogger("chrome_devtools");
 
 // MCP Server management
 let mcpProcess: ChildProcess | null = null;
@@ -72,7 +39,7 @@ async function ensureMcpServer(): Promise<boolean> {
 
   initializationPromise = new Promise(async (resolve) => {
     try {
-      await logInfo("Starting Chrome DevTools MCP server...");
+      log.info("Starting Chrome DevTools MCP server...");
 
       mcpProcess = spawn("npx", ["chrome-devtools-mcp@latest"], {
         stdio: ["pipe", "pipe", "pipe"],
@@ -87,17 +54,17 @@ async function ensureMcpServer(): Promise<boolean> {
       });
 
       mcpProcess.stderr?.on("data", (data: Buffer) => {
-        logInfo(`MCP stderr: ${data.toString()}`);
+        log.info(`MCP stderr: ${data.toString()}`);
       });
 
       mcpProcess.on("error", (error) => {
-        logError("mcp_process", error.message);
+        log.error("mcp_process", error.message);
         serverInitialized = false;
         initializationPromise = null;
       });
 
       mcpProcess.on("exit", (code) => {
-        logInfo(`MCP server exited with code ${code}`);
+        log.info(`MCP server exited with code ${code}`);
         serverInitialized = false;
         initializationPromise = null;
         mcpProcess = null;
@@ -121,11 +88,10 @@ async function ensureMcpServer(): Promise<boolean> {
       await new Promise((r) => setTimeout(r, 2000));
 
       serverInitialized = true;
-      await logInfo("Chrome DevTools MCP server initialized");
+      log.info("Chrome DevTools MCP server initialized");
       resolve(true);
     } catch (error) {
-      const err = error as Error;
-      await logError("ensureMcpServer", err.message);
+      log.error("ensureMcpServer", extractErrorMessage(error));
       initializationPromise = null;
       resolve(false);
     }
@@ -178,7 +144,7 @@ async function callTool(
   toolName: string,
   args: Record<string, unknown>
 ): Promise<{ success: boolean; result?: unknown; error?: string }> {
-  await logInfo(`Calling Chrome DevTools tool: ${toolName}`);
+  log.info(`Calling Chrome DevTools tool: ${toolName}`);
 
   const serverReady = await ensureMcpServer();
   if (!serverReady) {
@@ -216,8 +182,7 @@ async function callTool(
     } catch (error) {
       clearTimeout(timeout);
       pendingRequests.delete(id);
-      const err = error as Error;
-      resolve({ success: false, error: err.message });
+      resolve({ success: false, error: extractErrorMessage(error) });
     }
   });
 }
@@ -233,12 +198,12 @@ export async function navigate_page(args: {
   url: string;
   pageId?: string;
 }): Promise<{ success: boolean; result?: unknown; error?: string }> {
-  logCall("navigate_page", args);
+  log.call("navigate_page", args);
   const result = await callTool("navigate_page", args);
   if (result.success) {
-    logSuccess("navigate_page", result.result);
+    log.success("navigate_page", result.result);
   } else {
-    logError("navigate_page", result.error || "Unknown error");
+    log.error("navigate_page", result.error || "Unknown error");
   }
   return result;
 }
@@ -250,12 +215,12 @@ export async function navigate_page(args: {
 export async function new_page(args: {
   url?: string;
 }): Promise<{ success: boolean; result?: unknown; error?: string }> {
-  logCall("new_page", args);
+  log.call("new_page", args);
   const result = await callTool("new_page", args);
   if (result.success) {
-    logSuccess("new_page", result.result);
+    log.success("new_page", result.result);
   } else {
-    logError("new_page", result.error || "Unknown error");
+    log.error("new_page", result.error || "Unknown error");
   }
   return result;
 }
@@ -267,12 +232,12 @@ export async function new_page(args: {
 export async function close_page(args: {
   pageId: string;
 }): Promise<{ success: boolean; result?: unknown; error?: string }> {
-  logCall("close_page", args);
+  log.call("close_page", args);
   const result = await callTool("close_page", args);
   if (result.success) {
-    logSuccess("close_page", result.result);
+    log.success("close_page", result.result);
   } else {
-    logError("close_page", result.error || "Unknown error");
+    log.error("close_page", result.error || "Unknown error");
   }
   return result;
 }
@@ -285,12 +250,12 @@ export async function list_pages(args: Record<string, never> = {}): Promise<{
   result?: unknown;
   error?: string;
 }> {
-  logCall("list_pages", args);
+  log.call("list_pages", args);
   const result = await callTool("list_pages", {});
   if (result.success) {
-    logSuccess("list_pages", result.result);
+    log.success("list_pages", result.result);
   } else {
-    logError("list_pages", result.error || "Unknown error");
+    log.error("list_pages", result.error || "Unknown error");
   }
   return result;
 }
@@ -302,12 +267,12 @@ export async function list_pages(args: Record<string, never> = {}): Promise<{
 export async function select_page(args: {
   pageId: string;
 }): Promise<{ success: boolean; result?: unknown; error?: string }> {
-  logCall("select_page", args);
+  log.call("select_page", args);
   const result = await callTool("select_page", args);
   if (result.success) {
-    logSuccess("select_page", result.result);
+    log.success("select_page", result.result);
   } else {
-    logError("select_page", result.error || "Unknown error");
+    log.error("select_page", result.error || "Unknown error");
   }
   return result;
 }
@@ -323,12 +288,12 @@ export async function wait_for(args: {
   timeout?: number;
   pageId?: string;
 }): Promise<{ success: boolean; result?: unknown; error?: string }> {
-  logCall("wait_for", args);
+  log.call("wait_for", args);
   const result = await callTool("wait_for", args);
   if (result.success) {
-    logSuccess("wait_for", result.result);
+    log.success("wait_for", result.result);
   } else {
-    logError("wait_for", result.error || "Unknown error");
+    log.error("wait_for", result.error || "Unknown error");
   }
   return result;
 }
@@ -348,12 +313,12 @@ export async function click(args: {
   clickCount?: number;
   pageId?: string;
 }): Promise<{ success: boolean; result?: unknown; error?: string }> {
-  logCall("click", args);
+  log.call("click", args);
   const result = await callTool("click", args);
   if (result.success) {
-    logSuccess("click", result.result);
+    log.success("click", result.result);
   } else {
-    logError("click", result.error || "Unknown error");
+    log.error("click", result.error || "Unknown error");
   }
   return result;
 }
@@ -369,12 +334,12 @@ export async function fill(args: {
   value: string;
   pageId?: string;
 }): Promise<{ success: boolean; result?: unknown; error?: string }> {
-  logCall("fill", args);
+  log.call("fill", args);
   const result = await callTool("fill", args);
   if (result.success) {
-    logSuccess("fill", result.result);
+    log.success("fill", result.result);
   } else {
-    logError("fill", result.error || "Unknown error");
+    log.error("fill", result.error || "Unknown error");
   }
   return result;
 }
@@ -388,12 +353,12 @@ export async function fill_form(args: {
   fields: Record<string, string>;
   pageId?: string;
 }): Promise<{ success: boolean; result?: unknown; error?: string }> {
-  logCall("fill_form", args);
+  log.call("fill_form", args);
   const result = await callTool("fill_form", args);
   if (result.success) {
-    logSuccess("fill_form", result.result);
+    log.success("fill_form", result.result);
   } else {
-    logError("fill_form", result.error || "Unknown error");
+    log.error("fill_form", result.error || "Unknown error");
   }
   return result;
 }
@@ -409,12 +374,12 @@ export async function press_key(args: {
   modifiers?: string[];
   pageId?: string;
 }): Promise<{ success: boolean; result?: unknown; error?: string }> {
-  logCall("press_key", args);
+  log.call("press_key", args);
   const result = await callTool("press_key", args);
   if (result.success) {
-    logSuccess("press_key", result.result);
+    log.success("press_key", result.result);
   } else {
-    logError("press_key", result.error || "Unknown error");
+    log.error("press_key", result.error || "Unknown error");
   }
   return result;
 }
@@ -428,12 +393,12 @@ export async function hover(args: {
   selector: string;
   pageId?: string;
 }): Promise<{ success: boolean; result?: unknown; error?: string }> {
-  logCall("hover", args);
+  log.call("hover", args);
   const result = await callTool("hover", args);
   if (result.success) {
-    logSuccess("hover", result.result);
+    log.success("hover", result.result);
   } else {
-    logError("hover", result.error || "Unknown error");
+    log.error("hover", result.error || "Unknown error");
   }
   return result;
 }
@@ -449,12 +414,12 @@ export async function drag(args: {
   targetSelector: string;
   pageId?: string;
 }): Promise<{ success: boolean; result?: unknown; error?: string }> {
-  logCall("drag", args);
+  log.call("drag", args);
   const result = await callTool("drag", args);
   if (result.success) {
-    logSuccess("drag", result.result);
+    log.success("drag", result.result);
   } else {
-    logError("drag", result.error || "Unknown error");
+    log.error("drag", result.error || "Unknown error");
   }
   return result;
 }
@@ -470,12 +435,12 @@ export async function upload_file(args: {
   filePath: string;
   pageId?: string;
 }): Promise<{ success: boolean; result?: unknown; error?: string }> {
-  logCall("upload_file", args);
+  log.call("upload_file", args);
   const result = await callTool("upload_file", args);
   if (result.success) {
-    logSuccess("upload_file", result.result);
+    log.success("upload_file", result.result);
   } else {
-    logError("upload_file", result.error || "Unknown error");
+    log.error("upload_file", result.error || "Unknown error");
   }
   return result;
 }
@@ -491,12 +456,12 @@ export async function handle_dialog(args: {
   promptText?: string;
   pageId?: string;
 }): Promise<{ success: boolean; result?: unknown; error?: string }> {
-  logCall("handle_dialog", args);
+  log.call("handle_dialog", args);
   const result = await callTool("handle_dialog", args);
   if (result.success) {
-    logSuccess("handle_dialog", result.result);
+    log.success("handle_dialog", result.result);
   } else {
-    logError("handle_dialog", result.error || "Unknown error");
+    log.error("handle_dialog", result.error || "Unknown error");
   }
   return result;
 }
@@ -512,12 +477,12 @@ export async function list_console_messages(args: {
   pageId?: string;
   types?: string[];
 }): Promise<{ success: boolean; result?: unknown; error?: string }> {
-  logCall("list_console_messages", args);
+  log.call("list_console_messages", args);
   const result = await callTool("list_console_messages", args);
   if (result.success) {
-    logSuccess("list_console_messages", result.result);
+    log.success("list_console_messages", result.result);
   } else {
-    logError("list_console_messages", result.error || "Unknown error");
+    log.error("list_console_messages", result.error || "Unknown error");
   }
   return result;
 }
@@ -531,12 +496,12 @@ export async function get_console_message(args: {
   messageId: string;
   pageId?: string;
 }): Promise<{ success: boolean; result?: unknown; error?: string }> {
-  logCall("get_console_message", args);
+  log.call("get_console_message", args);
   const result = await callTool("get_console_message", args);
   if (result.success) {
-    logSuccess("get_console_message", result.result);
+    log.success("get_console_message", result.result);
   } else {
-    logError("get_console_message", result.error || "Unknown error");
+    log.error("get_console_message", result.error || "Unknown error");
   }
   return result;
 }
@@ -550,12 +515,12 @@ export async function list_network_requests(args: {
   pageId?: string;
   filter?: string;
 }): Promise<{ success: boolean; result?: unknown; error?: string }> {
-  logCall("list_network_requests", args);
+  log.call("list_network_requests", args);
   const result = await callTool("list_network_requests", args);
   if (result.success) {
-    logSuccess("list_network_requests", result.result);
+    log.success("list_network_requests", result.result);
   } else {
-    logError("list_network_requests", result.error || "Unknown error");
+    log.error("list_network_requests", result.error || "Unknown error");
   }
   return result;
 }
@@ -569,12 +534,12 @@ export async function get_network_request(args: {
   requestId: string;
   pageId?: string;
 }): Promise<{ success: boolean; result?: unknown; error?: string }> {
-  logCall("get_network_request", args);
+  log.call("get_network_request", args);
   const result = await callTool("get_network_request", args);
   if (result.success) {
-    logSuccess("get_network_request", result.result);
+    log.success("get_network_request", result.result);
   } else {
-    logError("get_network_request", result.error || "Unknown error");
+    log.error("get_network_request", result.error || "Unknown error");
   }
   return result;
 }
@@ -590,12 +555,12 @@ export async function evaluate_script(args: {
   returnByValue?: boolean;
   pageId?: string;
 }): Promise<{ success: boolean; result?: unknown; error?: string }> {
-  logCall("evaluate_script", args);
+  log.call("evaluate_script", args);
   const result = await callTool("evaluate_script", args);
   if (result.success) {
-    logSuccess("evaluate_script", result.result);
+    log.success("evaluate_script", result.result);
   } else {
-    logError("evaluate_script", result.error || "Unknown error");
+    log.error("evaluate_script", result.error || "Unknown error");
   }
   return result;
 }
@@ -611,12 +576,12 @@ export async function take_screenshot(args: {
   pageId?: string;
   fullPage?: boolean;
 }): Promise<{ success: boolean; result?: unknown; error?: string }> {
-  logCall("take_screenshot", args);
+  log.call("take_screenshot", args);
   const result = await callTool("take_screenshot", args);
   if (result.success) {
-    logSuccess("take_screenshot", result.result);
+    log.success("take_screenshot", result.result);
   } else {
-    logError("take_screenshot", result.error || "Unknown error");
+    log.error("take_screenshot", result.error || "Unknown error");
   }
   return result;
 }
@@ -628,12 +593,12 @@ export async function take_screenshot(args: {
 export async function take_snapshot(args: {
   pageId?: string;
 }): Promise<{ success: boolean; result?: unknown; error?: string }> {
-  logCall("take_snapshot", args);
+  log.call("take_snapshot", args);
   const result = await callTool("take_snapshot", args);
   if (result.success) {
-    logSuccess("take_snapshot", result.result);
+    log.success("take_snapshot", result.result);
   } else {
-    logError("take_snapshot", result.error || "Unknown error");
+    log.error("take_snapshot", result.error || "Unknown error");
   }
   return result;
 }
@@ -649,12 +614,12 @@ export async function emulate(args: {
   device: string;
   pageId?: string;
 }): Promise<{ success: boolean; result?: unknown; error?: string }> {
-  logCall("emulate", args);
+  log.call("emulate", args);
   const result = await callTool("emulate", args);
   if (result.success) {
-    logSuccess("emulate", result.result);
+    log.success("emulate", result.result);
   } else {
-    logError("emulate", result.error || "Unknown error");
+    log.error("emulate", result.error || "Unknown error");
   }
   return result;
 }
@@ -670,12 +635,12 @@ export async function resize_page(args: {
   height: number;
   pageId?: string;
 }): Promise<{ success: boolean; result?: unknown; error?: string }> {
-  logCall("resize_page", args);
+  log.call("resize_page", args);
   const result = await callTool("resize_page", args);
   if (result.success) {
-    logSuccess("resize_page", result.result);
+    log.success("resize_page", result.result);
   } else {
-    logError("resize_page", result.error || "Unknown error");
+    log.error("resize_page", result.error || "Unknown error");
   }
   return result;
 }
@@ -689,12 +654,12 @@ export async function resize_page(args: {
 export async function performance_start_trace(args: {
   pageId?: string;
 }): Promise<{ success: boolean; result?: unknown; error?: string }> {
-  logCall("performance_start_trace", args);
+  log.call("performance_start_trace", args);
   const result = await callTool("performance_start_trace", args);
   if (result.success) {
-    logSuccess("performance_start_trace", result.result);
+    log.success("performance_start_trace", result.result);
   } else {
-    logError("performance_start_trace", result.error || "Unknown error");
+    log.error("performance_start_trace", result.error || "Unknown error");
   }
   return result;
 }
@@ -706,12 +671,12 @@ export async function performance_start_trace(args: {
 export async function performance_stop_trace(args: {
   pageId?: string;
 }): Promise<{ success: boolean; result?: unknown; error?: string }> {
-  logCall("performance_stop_trace", args);
+  log.call("performance_stop_trace", args);
   const result = await callTool("performance_stop_trace", args);
   if (result.success) {
-    logSuccess("performance_stop_trace", result.result);
+    log.success("performance_stop_trace", result.result);
   } else {
-    logError("performance_stop_trace", result.error || "Unknown error");
+    log.error("performance_stop_trace", result.error || "Unknown error");
   }
   return result;
 }
@@ -723,12 +688,12 @@ export async function performance_stop_trace(args: {
 export async function performance_analyze_insight(args: {
   pageId?: string;
 }): Promise<{ success: boolean; result?: unknown; error?: string }> {
-  logCall("performance_analyze_insight", args);
+  log.call("performance_analyze_insight", args);
   const result = await callTool("performance_analyze_insight", args);
   if (result.success) {
-    logSuccess("performance_analyze_insight", result.result);
+    log.success("performance_analyze_insight", result.result);
   } else {
-    logError("performance_analyze_insight", result.error || "Unknown error");
+    log.error("performance_analyze_insight", result.error || "Unknown error");
   }
   return result;
 }

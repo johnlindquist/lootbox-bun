@@ -7,48 +7,15 @@
  * Implements direct MCP-over-HTTP communication with the DeepWiki server.
  */
 
+import { createLogger, extractErrorMessage, type McpSession } from "./shared/index.ts";
+
 const DEEPWIKI_MCP_URL = "https://mcp.deepwiki.com/mcp";
 
-// Logging utilities - writes to file on disk
-import { appendFileSync, mkdirSync, existsSync } from "node:fs";
-import { join } from "node:path";
-
-const LOG_DIR = join(process.env.HOME || "/tmp", ".lootbox-logs");
-const LOG_FILE = join(LOG_DIR, "deepwiki.log");
-
-// Helper to append log (creates dir if needed)
-const writeLog = async (level: string, message: string) => {
-  try {
-    // Ensure directory exists
-    if (!existsSync(LOG_DIR)) {
-      mkdirSync(LOG_DIR, { recursive: true });
-    }
-    const timestamp = new Date().toISOString();
-    const line = `[${timestamp}] [${level}] ${message}\n`;
-    appendFileSync(LOG_FILE, line);
-  } catch (e) {
-    // Silent fail if logging fails
-  }
-};
-
-const logCall = async (fn: string, args: Record<string, unknown>) => {
-  await writeLog("CALL", `📞 ${fn}(${JSON.stringify(args)})`);
-};
-const logSuccess = async (fn: string, result: unknown) => {
-  const preview = typeof result === 'string'
-    ? result.substring(0, 200) + (result.length > 200 ? '...' : '')
-    : JSON.stringify(result).substring(0, 200);
-  await writeLog("SUCCESS", `✅ ${fn} → ${preview}`);
-};
-const logError = async (fn: string, error: string) => {
-  await writeLog("ERROR", `❌ ${fn} → ${error}`);
-};
-const logInfo = async (message: string) => {
-  await writeLog("INFO", `ℹ️ ${message}`);
-};
+// Create logger for this tool
+const log = createLogger("deepwiki");
 
 // Session cache - we'll reuse sessions for better performance
-let cachedSession: { id: string; expiresAt: number } | null = null;
+let cachedSession: McpSession | null = null;
 
 /**
  * Parse SSE response to extract JSON-RPC result
@@ -84,7 +51,7 @@ async function initializeSession(): Promise<{ success: boolean; sessionId?: stri
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "Accept": "application/json, text/event-stream",
+        Accept: "application/json, text/event-stream",
       },
       body: JSON.stringify({
         jsonrpc: "2.0",
@@ -116,8 +83,7 @@ async function initializeSession(): Promise<{ success: boolean; sessionId?: stri
 
     return { success: true, sessionId };
   } catch (error) {
-    const err = error as Error;
-    return { success: false, error: err.message || String(error) };
+    return { success: false, error: extractErrorMessage(error) };
   }
 }
 
@@ -149,22 +115,22 @@ async function callDeepWikiTool(
   toolName: string,
   args: Record<string, unknown>
 ): Promise<{ success: boolean; result?: string; error?: string }> {
-  logInfo(`Calling DeepWiki MCP tool: ${toolName}`);
+  log.info(`Calling DeepWiki MCP tool: ${toolName}`);
 
   // Get session
   const session = await getSession();
   if (!session.success || !session.sessionId) {
-    logError(toolName, session.error || "Failed to get session");
+    log.error(toolName, session.error || "Failed to get session");
     return { success: false, error: session.error || "Failed to get session" };
   }
-  logInfo(`Session acquired: ${session.sessionId.substring(0, 20)}...`);
+  log.info(`Session acquired: ${session.sessionId.substring(0, 20)}...`);
 
   try {
     const response = await fetch(DEEPWIKI_MCP_URL, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "Accept": "application/json, text/event-stream",
+        Accept: "application/json, text/event-stream",
         "mcp-session-id": session.sessionId,
       },
       body: JSON.stringify({
@@ -206,8 +172,7 @@ async function callDeepWikiTool(
 
     return { success: true, result: JSON.stringify(result) };
   } catch (error) {
-    const err = error as Error;
-    return { success: false, error: err.message || String(error) };
+    return { success: false, error: extractErrorMessage(error) };
   }
 }
 
@@ -220,13 +185,13 @@ async function callDeepWikiTool(
 export async function read_wiki_structure(args: {
   repo_name: string;
 }): Promise<{ success: boolean; structure?: string; error?: string }> {
-  logCall("read_wiki_structure", args);
+  log.call("read_wiki_structure", args);
   const { repo_name } = args;
 
   // Validate repo format
   if (!repo_name.includes("/")) {
     const err = `Invalid repo format. Expected 'owner/repo', got '${repo_name}'`;
-    logError("read_wiki_structure", err);
+    log.error("read_wiki_structure", err);
     return { success: false, error: err };
   }
 
@@ -235,10 +200,10 @@ export async function read_wiki_structure(args: {
   });
 
   if (result.success) {
-    logSuccess("read_wiki_structure", result.result);
+    log.success("read_wiki_structure", result.result);
     return { success: true, structure: result.result };
   }
-  logError("read_wiki_structure", result.error || "Unknown error");
+  log.error("read_wiki_structure", result.error || "Unknown error");
   return { success: false, error: result.error };
 }
 
@@ -251,13 +216,13 @@ export async function read_wiki_structure(args: {
 export async function read_wiki_contents(args: {
   repo_name: string;
 }): Promise<{ success: boolean; contents?: string; error?: string }> {
-  logCall("read_wiki_contents", args);
+  log.call("read_wiki_contents", args);
   const { repo_name } = args;
 
   // Validate repo format
   if (!repo_name.includes("/")) {
     const err = `Invalid repo format. Expected 'owner/repo', got '${repo_name}'`;
-    logError("read_wiki_contents", err);
+    log.error("read_wiki_contents", err);
     return { success: false, error: err };
   }
 
@@ -266,10 +231,10 @@ export async function read_wiki_contents(args: {
   });
 
   if (result.success) {
-    logSuccess("read_wiki_contents", result.result);
+    log.success("read_wiki_contents", result.result);
     return { success: true, contents: result.result };
   }
-  logError("read_wiki_contents", result.error || "Unknown error");
+  log.error("read_wiki_contents", result.error || "Unknown error");
   return { success: false, error: result.error };
 }
 
@@ -284,19 +249,19 @@ export async function ask_question(args: {
   repo_name: string;
   question: string;
 }): Promise<{ success: boolean; answer?: string; error?: string }> {
-  logCall("ask_question", args);
+  log.call("ask_question", args);
   const { repo_name, question } = args;
 
   // Validate repo format
   if (!repo_name.includes("/")) {
     const err = `Invalid repo format. Expected 'owner/repo', got '${repo_name}'`;
-    logError("ask_question", err);
+    log.error("ask_question", err);
     return { success: false, error: err };
   }
 
   if (!question || question.trim().length === 0) {
     const err = "Question cannot be empty";
-    logError("ask_question", err);
+    log.error("ask_question", err);
     return { success: false, error: err };
   }
 
@@ -306,9 +271,9 @@ export async function ask_question(args: {
   });
 
   if (result.success) {
-    logSuccess("ask_question", result.result);
+    log.success("ask_question", result.result);
     return { success: true, answer: result.result };
   }
-  logError("ask_question", result.error || "Unknown error");
+  log.error("ask_question", result.error || "Unknown error");
   return { success: false, error: result.error };
 }

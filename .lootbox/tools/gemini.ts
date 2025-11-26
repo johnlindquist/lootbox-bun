@@ -5,48 +5,15 @@
  * capabilities that benefit from Gemini's massive context window.
  */
 
-import { appendFileSync, mkdirSync, existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, readFileSync } from "node:fs";
+import {
+  createLogger,
+  extractErrorMessage,
+  type ProgressCallback,
+} from "./shared/index.ts";
 
-// Logging utilities - writes to file on disk
-const LOG_DIR = join(process.env.HOME || "/tmp", ".lootbox-logs");
-const LOG_FILE = join(LOG_DIR, "gemini.log");
-
-// Helper to append log (creates dir if needed)
-const writeLog = async (level: string, message: string) => {
-  try {
-    if (!existsSync(LOG_DIR)) {
-      mkdirSync(LOG_DIR, { recursive: true });
-    }
-    const timestamp = new Date().toISOString();
-    const line = `[${timestamp}] [${level}] ${message}\n`;
-    appendFileSync(LOG_FILE, line);
-  } catch (e) {
-    // Silent fail if logging fails
-  }
-};
-
-const logCall = async (fn: string, args: Record<string, unknown>) => {
-  await writeLog("CALL", `📞 ${fn}(${JSON.stringify(args)})`);
-};
-const logSuccess = async (fn: string, result: unknown) => {
-  const preview =
-    typeof result === "string"
-      ? result.substring(0, 200) + (result.length > 200 ? "..." : "")
-      : JSON.stringify(result).substring(0, 200);
-  await writeLog("SUCCESS", `✅ ${fn} → ${preview}`);
-};
-const logError = async (fn: string, error: string) => {
-  await writeLog("ERROR", `❌ ${fn} → ${error}`);
-};
-const logInfo = async (message: string) => {
-  await writeLog("INFO", `ℹ️ ${message}`);
-};
-
-/**
- * Progress callback type for streaming updates
- */
-type ProgressCallback = (message: string) => void;
+// Create logger for this tool
+const log = createLogger("gemini");
 
 // Global progress callback - set by the worker when streaming is enabled
 let globalProgressCallback: ProgressCallback | null = null;
@@ -84,7 +51,7 @@ async function runGemini(
   const { stdin, timeout = 120000 } = options;
 
   try {
-    await logInfo(`Executing Gemini with prompt: ${prompt.substring(0, 100)}...`);
+    log.info(`Executing Gemini with prompt: ${prompt.substring(0, 100)}...`);
     sendProgress("Starting Gemini request...");
 
     const startTime = Date.now();
@@ -96,7 +63,6 @@ async function runGemini(
     }, 5000);
 
     try {
-      let result;
       if (stdin) {
         // Pipe content through stdin - gemini will see stdin content + prompt
         // Using raw array form to avoid shell escaping issues
@@ -144,9 +110,7 @@ async function runGemini(
       clearInterval(progressInterval);
     }
   } catch (error) {
-    const err = error as { stderr?: { toString(): string }; message?: string };
-    const errorMsg = err.stderr?.toString() || err.message || String(error);
-    return { success: false, output: "", error: errorMsg };
+    return { success: false, output: "", error: extractErrorMessage(error) };
   }
 }
 
@@ -161,20 +125,18 @@ export async function research(args: {
   prompt: string;
   context?: string;
 }): Promise<{ success: boolean; result?: string; error?: string }> {
-  logCall("research", args);
+  log.call("research", args);
   const { prompt, context } = args;
 
-  const fullPrompt = context
-    ? `${prompt}\n\nContext:\n${context}`
-    : prompt;
+  const fullPrompt = context ? `${prompt}\n\nContext:\n${context}` : prompt;
 
   const result = await runGemini(fullPrompt);
 
   if (result.success) {
-    logSuccess("research", result.output);
+    log.success("research", result.output);
     return { success: true, result: result.output };
   }
-  logError("research", result.error || "Unknown error");
+  log.error("research", result.error || "Unknown error");
   return { success: false, error: result.error };
 }
 
@@ -191,7 +153,7 @@ export async function summarize(args: {
   content?: string;
   focus?: string;
 }): Promise<{ success: boolean; summary?: string; error?: string }> {
-  logCall("summarize", args);
+  log.call("summarize", args);
   const { file_path, content, focus } = args;
 
   let textContent = content || "";
@@ -200,21 +162,21 @@ export async function summarize(args: {
     try {
       if (!existsSync(file_path)) {
         const err = `File not found: ${file_path}`;
-        logError("summarize", err);
+        log.error("summarize", err);
         return { success: false, error: err };
       }
       textContent = readFileSync(file_path, "utf-8");
-      await logInfo(`Read ${textContent.length} characters from ${file_path}`);
+      log.info(`Read ${textContent.length} characters from ${file_path}`);
     } catch (error) {
-      const err = error as Error;
-      logError("summarize", err.message);
-      return { success: false, error: err.message };
+      const err = extractErrorMessage(error);
+      log.error("summarize", err);
+      return { success: false, error: err };
     }
   }
 
   if (!textContent) {
     const err = "No content provided - specify either file_path or content";
-    logError("summarize", err);
+    log.error("summarize", err);
     return { success: false, error: err };
   }
 
@@ -225,10 +187,10 @@ export async function summarize(args: {
   const result = await runGemini(prompt, { stdin: textContent });
 
   if (result.success) {
-    logSuccess("summarize", result.output);
+    log.success("summarize", result.output);
     return { success: true, summary: result.output };
   }
-  logError("summarize", result.error || "Unknown error");
+  log.error("summarize", result.error || "Unknown error");
   return { success: false, error: result.error };
 }
 
@@ -245,7 +207,7 @@ export async function analyze_code(args: {
   code?: string;
   question: string;
 }): Promise<{ success: boolean; analysis?: string; error?: string }> {
-  logCall("analyze_code", args);
+  log.call("analyze_code", args);
   const { file_path, code, question } = args;
 
   let codeContent = code || "";
@@ -254,21 +216,21 @@ export async function analyze_code(args: {
     try {
       if (!existsSync(file_path)) {
         const err = `File not found: ${file_path}`;
-        logError("analyze_code", err);
+        log.error("analyze_code", err);
         return { success: false, error: err };
       }
       codeContent = readFileSync(file_path, "utf-8");
-      await logInfo(`Read ${codeContent.length} characters from ${file_path}`);
+      log.info(`Read ${codeContent.length} characters from ${file_path}`);
     } catch (error) {
-      const err = error as Error;
-      logError("analyze_code", err.message);
-      return { success: false, error: err.message };
+      const err = extractErrorMessage(error);
+      log.error("analyze_code", err);
+      return { success: false, error: err };
     }
   }
 
   if (!codeContent) {
     const err = "No code provided - specify either file_path or code";
-    logError("analyze_code", err);
+    log.error("analyze_code", err);
     return { success: false, error: err };
   }
 
@@ -276,10 +238,10 @@ export async function analyze_code(args: {
   const result = await runGemini(prompt, { stdin: codeContent });
 
   if (result.success) {
-    logSuccess("analyze_code", result.output);
+    log.success("analyze_code", result.output);
     return { success: true, analysis: result.output };
   }
-  logError("analyze_code", result.error || "Unknown error");
+  log.error("analyze_code", result.error || "Unknown error");
   return { success: false, error: result.error };
 }
 
@@ -294,12 +256,12 @@ export async function compare(args: {
   items: Array<{ label: string; content: string }>;
   comparison_prompt: string;
 }): Promise<{ success: boolean; comparison?: string; error?: string }> {
-  logCall("compare", args);
+  log.call("compare", args);
   const { items, comparison_prompt } = args;
 
   if (!items || items.length < 2) {
     const err = "At least 2 items required for comparison";
-    logError("compare", err);
+    log.error("compare", err);
     return { success: false, error: err };
   }
 
@@ -311,10 +273,10 @@ export async function compare(args: {
   const result = await runGemini(prompt);
 
   if (result.success) {
-    logSuccess("compare", result.output);
+    log.success("compare", result.output);
     return { success: true, comparison: result.output };
   }
-  logError("compare", result.error || "Unknown error");
+  log.error("compare", result.error || "Unknown error");
   return { success: false, error: result.error };
 }
 
@@ -329,7 +291,7 @@ export async function think(args: {
   problem: string;
   constraints?: string;
 }): Promise<{ success: boolean; reasoning?: string; error?: string }> {
-  logCall("think", args);
+  log.call("think", args);
   const { problem, constraints } = args;
 
   let prompt = `Think through this problem step by step:\n\n${problem}`;
@@ -341,10 +303,10 @@ export async function think(args: {
   const result = await runGemini(prompt);
 
   if (result.success) {
-    logSuccess("think", result.output);
+    log.success("think", result.output);
     return { success: true, reasoning: result.output };
   }
-  logError("think", result.error || "Unknown error");
+  log.error("think", result.error || "Unknown error");
   return { success: false, error: result.error };
 }
 
@@ -360,7 +322,7 @@ export async function extract(args: {
   extract_what: string;
   output_format?: string;
 }): Promise<{ success: boolean; extracted?: string; error?: string }> {
-  logCall("extract", args);
+  log.call("extract", args);
   const { content, extract_what, output_format } = args;
 
   let prompt = `Extract ${extract_what} from the following content.`;
@@ -371,10 +333,10 @@ export async function extract(args: {
   const result = await runGemini(prompt, { stdin: content });
 
   if (result.success) {
-    logSuccess("extract", result.output);
+    log.success("extract", result.output);
     return { success: true, extracted: result.output };
   }
-  logError("extract", result.error || "Unknown error");
+  log.error("extract", result.error || "Unknown error");
   return { success: false, error: result.error };
 }
 
@@ -387,16 +349,16 @@ export async function extract(args: {
 export async function ask(args: {
   question: string;
 }): Promise<{ success: boolean; answer?: string; error?: string }> {
-  logCall("ask", args);
+  log.call("ask", args);
   const { question } = args;
 
   const result = await runGemini(question);
 
   if (result.success) {
-    logSuccess("ask", result.output);
+    log.success("ask", result.output);
     return { success: true, answer: result.output };
   }
-  logError("ask", result.error || "Unknown error");
+  log.error("ask", result.error || "Unknown error");
   return { success: false, error: result.error };
 }
 
@@ -412,7 +374,7 @@ export async function web_search(args: {
   query: string;
   focus?: string;
 }): Promise<{ success: boolean; results?: string; error?: string }> {
-  logCall("web_search", args);
+  log.call("web_search", args);
   const { query, focus } = args;
 
   let prompt = `Search the web and provide comprehensive, up-to-date information about: ${query}`;
@@ -424,10 +386,10 @@ export async function web_search(args: {
   const result = await runGemini(prompt);
 
   if (result.success) {
-    logSuccess("web_search", result.output);
+    log.success("web_search", result.output);
     return { success: true, results: result.output };
   }
-  logError("web_search", result.error || "Unknown error");
+  log.error("web_search", result.error || "Unknown error");
   return { success: false, error: result.error };
 }
 
@@ -442,22 +404,23 @@ export async function get_news(args: {
   topic: string;
   timeframe?: string;
 }): Promise<{ success: boolean; news?: string; error?: string }> {
-  logCall("get_news", args);
+  log.call("get_news", args);
   const { topic, timeframe } = args;
 
   let prompt = `What is the latest news about: ${topic}`;
   if (timeframe) {
     prompt += ` from ${timeframe}`;
   }
-  prompt += "\n\nProvide a summary of the most important recent developments, including dates and sources where available.";
+  prompt +=
+    "\n\nProvide a summary of the most important recent developments, including dates and sources where available.";
 
   const result = await runGemini(prompt);
 
   if (result.success) {
-    logSuccess("get_news", result.output);
+    log.success("get_news", result.output);
     return { success: true, news: result.output };
   }
-  logError("get_news", result.error || "Unknown error");
+  log.error("get_news", result.error || "Unknown error");
   return { success: false, error: result.error };
 }
 
@@ -470,7 +433,7 @@ export async function get_news(args: {
 export async function lookup(args: {
   query: string;
 }): Promise<{ success: boolean; info?: string; error?: string }> {
-  logCall("lookup", args);
+  log.call("lookup", args);
   const { query } = args;
 
   const prompt = `Look up and provide accurate, current information about: ${query}\n\nInclude relevant facts, figures, and sources.`;
@@ -478,10 +441,10 @@ export async function lookup(args: {
   const result = await runGemini(prompt);
 
   if (result.success) {
-    logSuccess("lookup", result.output);
+    log.success("lookup", result.output);
     return { success: true, info: result.output };
   }
-  logError("lookup", result.error || "Unknown error");
+  log.error("lookup", result.error || "Unknown error");
   return { success: false, error: result.error };
 }
 
@@ -506,10 +469,9 @@ async function readFilesWithLabels(
       }
       const content = readFileSync(filePath, "utf-8");
       contents.push(`=== ${filePath} ===\n${content}`);
-      await logInfo(`Read ${content.length} characters from ${filePath}`);
+      log.info(`Read ${content.length} characters from ${filePath}`);
     } catch (error) {
-      const err = error as Error;
-      errors.push(`Error reading ${filePath}: ${err.message}`);
+      errors.push(`Error reading ${filePath}: ${extractErrorMessage(error)}`);
     }
   }
 
@@ -529,12 +491,12 @@ export async function analyze_project(args: {
   question: string;
   focus?: string;
 }): Promise<{ success: boolean; analysis?: string; files_read?: number; error?: string }> {
-  logCall("analyze_project", args);
+  log.call("analyze_project", args);
   const { file_paths, question, focus } = args;
 
   if (!file_paths || file_paths.length === 0) {
     const err = "No file paths provided";
-    logError("analyze_project", err);
+    log.error("analyze_project", err);
     return { success: false, error: err };
   }
 
@@ -542,7 +504,7 @@ export async function analyze_project(args: {
 
   if (!content) {
     const err = `Could not read any files: ${errors.join(", ")}`;
-    logError("analyze_project", err);
+    log.error("analyze_project", err);
     return { success: false, error: err };
   }
 
@@ -558,14 +520,14 @@ export async function analyze_project(args: {
   const result = await runGemini(prompt, { stdin: content });
 
   if (result.success) {
-    logSuccess("analyze_project", result.output);
+    log.success("analyze_project", result.output);
     return {
       success: true,
       analysis: result.output,
       files_read: file_paths.length - errors.length,
     };
   }
-  logError("analyze_project", result.error || "Unknown error");
+  log.error("analyze_project", result.error || "Unknown error");
   return { success: false, error: result.error };
 }
 
@@ -584,12 +546,12 @@ export async function evaluate_options(args: {
   file_paths?: string[];
   criteria?: string[];
 }): Promise<{ success: boolean; evaluation?: string; recommendation?: string; error?: string }> {
-  logCall("evaluate_options", args);
+  log.call("evaluate_options", args);
   const { problem, options, file_paths, criteria } = args;
 
   if (!options || options.length < 2) {
     const err = "At least 2 options required for evaluation";
-    logError("evaluate_options", err);
+    log.error("evaluate_options", err);
     return { success: false, error: err };
   }
 
@@ -608,7 +570,7 @@ export async function evaluate_options(args: {
   let prompt = `Evaluate these options for the following problem:\n\nProblem: ${problem}\n\nOptions:\n${optionsText}`;
 
   if (criteria && criteria.length > 0) {
-    prompt += `\n\nEvaluate against these criteria:\n${criteria.map(c => `- ${c}`).join("\n")}`;
+    prompt += `\n\nEvaluate against these criteria:\n${criteria.map((c) => `- ${c}`).join("\n")}`;
   }
 
   prompt += context;
@@ -623,11 +585,11 @@ End with a clear recommendation and reasoning.`;
   const result = await runGemini(prompt);
 
   if (result.success) {
-    logSuccess("evaluate_options", result.output);
+    log.success("evaluate_options", result.output);
     // Try to extract the recommendation (usually at the end)
     const lines = result.output.split("\n");
-    const recIdx = lines.findIndex(l =>
-      l.toLowerCase().includes("recommend") || l.toLowerCase().includes("conclusion")
+    const recIdx = lines.findIndex(
+      (l) => l.toLowerCase().includes("recommend") || l.toLowerCase().includes("conclusion")
     );
     const recommendation = recIdx >= 0 ? lines.slice(recIdx).join("\n") : undefined;
 
@@ -637,7 +599,7 @@ End with a clear recommendation and reasoning.`;
       recommendation,
     };
   }
-  logError("evaluate_options", result.error || "Unknown error");
+  log.error("evaluate_options", result.error || "Unknown error");
   return { success: false, error: result.error };
 }
 
@@ -656,21 +618,21 @@ export async function plan_implementation(args: {
   constraints?: string[];
   style?: "detailed" | "high-level";
 }): Promise<{ success: boolean; plan?: string; steps?: string[]; error?: string }> {
-  logCall("plan_implementation", args);
+  log.call("plan_implementation", args);
   const { goal, file_paths, constraints, style = "detailed" } = args;
 
   const { content, errors } = await readFilesWithLabels(file_paths);
 
   if (!content) {
     const err = `Could not read any files: ${errors.join(", ")}`;
-    logError("plan_implementation", err);
+    log.error("plan_implementation", err);
     return { success: false, error: err };
   }
 
   let prompt = `I need to: ${goal}\n\nAnalyze the following codebase and create an implementation plan.`;
 
   if (constraints && constraints.length > 0) {
-    prompt += `\n\nConstraints/Requirements:\n${constraints.map(c => `- ${c}`).join("\n")}`;
+    prompt += `\n\nConstraints/Requirements:\n${constraints.map((c) => `- ${c}`).join("\n")}`;
   }
 
   if (style === "detailed") {
@@ -697,11 +659,11 @@ export async function plan_implementation(args: {
   const result = await runGemini(prompt, { stdin: content });
 
   if (result.success) {
-    logSuccess("plan_implementation", result.output);
+    log.success("plan_implementation", result.output);
 
     // Try to extract steps from the output
     const stepMatches = result.output.match(/^\s*\d+\.\s+.+$/gm);
-    const steps = stepMatches ? stepMatches.map(s => s.trim()) : undefined;
+    const steps = stepMatches ? stepMatches.map((s) => s.trim()) : undefined;
 
     return {
       success: true,
@@ -709,7 +671,7 @@ export async function plan_implementation(args: {
       steps,
     };
   }
-  logError("plan_implementation", result.error || "Unknown error");
+  log.error("plan_implementation", result.error || "Unknown error");
   return { success: false, error: result.error };
 }
 
@@ -731,24 +693,27 @@ export async function review_code(args: {
   issues_found?: number;
   error?: string;
 }> {
-  logCall("review_code", args);
+  log.call("review_code", args);
   const { file_paths, focus = "all", severity_threshold = "warning" } = args;
 
   const { content, errors } = await readFilesWithLabels(file_paths);
 
   if (!content) {
     const err = `Could not read any files: ${errors.join(", ")}`;
-    logError("review_code", err);
+    log.error("review_code", err);
     return { success: false, error: err };
   }
 
   let focusAreas = "";
   if (focus === "security") {
-    focusAreas = "Focus on security vulnerabilities: injection attacks, authentication issues, data exposure, insecure dependencies.";
+    focusAreas =
+      "Focus on security vulnerabilities: injection attacks, authentication issues, data exposure, insecure dependencies.";
   } else if (focus === "performance") {
-    focusAreas = "Focus on performance issues: inefficient algorithms, memory leaks, unnecessary computations, N+1 queries.";
+    focusAreas =
+      "Focus on performance issues: inefficient algorithms, memory leaks, unnecessary computations, N+1 queries.";
   } else if (focus === "maintainability") {
-    focusAreas = "Focus on maintainability: code clarity, proper abstractions, documentation, testability, coupling.";
+    focusAreas =
+      "Focus on maintainability: code clarity, proper abstractions, documentation, testability, coupling.";
   } else {
     focusAreas = "Review for security, performance, maintainability, and best practices.";
   }
@@ -757,8 +722,8 @@ export async function review_code(args: {
     severity_threshold === "critical"
       ? "Only report critical issues that must be fixed."
       : severity_threshold === "warning"
-      ? "Report critical and warning-level issues."
-      : "Report all issues including minor suggestions.";
+        ? "Report critical and warning-level issues."
+        : "Report all issues including minor suggestions.";
 
   const prompt = `Perform a code review on the following files.
 
@@ -778,7 +743,7 @@ End with a summary of the overall code quality and key recommendations.`;
   const result = await runGemini(prompt, { stdin: content });
 
   if (result.success) {
-    logSuccess("review_code", result.output);
+    log.success("review_code", result.output);
 
     // Count issues by looking for severity markers
     const criticalCount = (result.output.match(/\*\*Critical\*\*/gi) || []).length;
@@ -792,7 +757,7 @@ End with a summary of the overall code quality and key recommendations.`;
       issues_found,
     };
   }
-  logError("review_code", result.error || "Unknown error");
+  log.error("review_code", result.error || "Unknown error");
   return { success: false, error: result.error };
 }
 
@@ -817,7 +782,7 @@ export async function reason_through(args: {
   confidence?: string;
   error?: string;
 }> {
-  logCall("reason_through", args);
+  log.call("reason_through", args);
   const { problem, file_paths, constraints, output_format = "both" } = args;
 
   let context = "";
@@ -834,7 +799,7 @@ export async function reason_through(args: {
   let prompt = `Think through this problem carefully and systematically:\n\n${problem}`;
 
   if (constraints && constraints.length > 0) {
-    prompt += `\n\nConstraints to consider:\n${constraints.map(c => `- ${c}`).join("\n")}`;
+    prompt += `\n\nConstraints to consider:\n${constraints.map((c) => `- ${c}`).join("\n")}`;
   }
 
   prompt += context;
@@ -851,20 +816,18 @@ export async function reason_through(args: {
   const result = await runGemini(prompt);
 
   if (result.success) {
-    logSuccess("reason_through", result.output);
+    log.success("reason_through", result.output);
 
     // Try to extract decision and confidence
     const lines = result.output.split("\n");
     const conclusionIdx = lines.findIndex(
-      l => l.toLowerCase().includes("conclusion") || l.toLowerCase().includes("decision")
+      (l) => l.toLowerCase().includes("conclusion") || l.toLowerCase().includes("decision")
     );
-    const confidenceIdx = lines.findIndex(l => l.toLowerCase().includes("confidence"));
+    const confidenceIdx = lines.findIndex((l) => l.toLowerCase().includes("confidence"));
 
     const decision =
       conclusionIdx >= 0
-        ? lines
-            .slice(conclusionIdx, confidenceIdx > conclusionIdx ? confidenceIdx : undefined)
-            .join("\n")
+        ? lines.slice(conclusionIdx, confidenceIdx > conclusionIdx ? confidenceIdx : undefined).join("\n")
         : undefined;
 
     const confidence =
@@ -877,7 +840,7 @@ export async function reason_through(args: {
       confidence,
     };
   }
-  logError("reason_through", result.error || "Unknown error");
+  log.error("reason_through", result.error || "Unknown error");
   return { success: false, error: result.error };
 }
 
@@ -896,14 +859,14 @@ export async function trace_flow(args: {
   trace_type?: "data" | "execution" | "dependencies";
   question?: string;
 }): Promise<{ success: boolean; trace?: string; flow_summary?: string; error?: string }> {
-  logCall("trace_flow", args);
+  log.call("trace_flow", args);
   const { starting_point, file_paths, trace_type = "execution", question } = args;
 
   const { content, errors } = await readFilesWithLabels(file_paths);
 
   if (!content) {
     const err = `Could not read any files: ${errors.join(", ")}`;
-    logError("trace_flow", err);
+    log.error("trace_flow", err);
     return { success: false, error: err };
   }
 
@@ -944,7 +907,7 @@ Show:
   const result = await runGemini(prompt, { stdin: content });
 
   if (result.success) {
-    logSuccess("trace_flow", result.output);
+    log.success("trace_flow", result.output);
 
     // Extract a brief summary from the first paragraph
     const paragraphs = result.output.split("\n\n");
@@ -956,6 +919,6 @@ Show:
       flow_summary,
     };
   }
-  logError("trace_flow", result.error || "Unknown error");
+  log.error("trace_flow", result.error || "Unknown error");
   return { success: false, error: result.error };
 }
