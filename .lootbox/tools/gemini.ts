@@ -484,3 +484,478 @@ export async function lookup(args: {
   logError("lookup", result.error || "Unknown error");
   return { success: false, error: result.error };
 }
+
+// ============================================================================
+// PROJECT ANALYSIS & DEEP THINKING TOOLS
+// ============================================================================
+
+/**
+ * Helper to read multiple files and combine them with labels
+ */
+async function readFilesWithLabels(
+  file_paths: string[]
+): Promise<{ content: string; errors: string[] }> {
+  const contents: string[] = [];
+  const errors: string[] = [];
+
+  for (const filePath of file_paths) {
+    try {
+      if (!existsSync(filePath)) {
+        errors.push(`File not found: ${filePath}`);
+        continue;
+      }
+      const content = readFileSync(filePath, "utf-8");
+      contents.push(`=== ${filePath} ===\n${content}`);
+      await logInfo(`Read ${content.length} characters from ${filePath}`);
+    } catch (error) {
+      const err = error as Error;
+      errors.push(`Error reading ${filePath}: ${err.message}`);
+    }
+  }
+
+  return { content: contents.join("\n\n"), errors };
+}
+
+/**
+ * Deeply analyze project files to understand architecture, patterns, and design decisions.
+ * Reads actual files and provides comprehensive analysis using Gemini's large context window.
+ *
+ * @param args.file_paths - Array of file paths to analyze
+ * @param args.question - What to analyze or understand about the code
+ * @param args.focus - Optional focus area (architecture, patterns, dependencies, flow, security)
+ */
+export async function analyze_project(args: {
+  file_paths: string[];
+  question: string;
+  focus?: string;
+}): Promise<{ success: boolean; analysis?: string; files_read?: number; error?: string }> {
+  logCall("analyze_project", args);
+  const { file_paths, question, focus } = args;
+
+  if (!file_paths || file_paths.length === 0) {
+    const err = "No file paths provided";
+    logError("analyze_project", err);
+    return { success: false, error: err };
+  }
+
+  const { content, errors } = await readFilesWithLabels(file_paths);
+
+  if (!content) {
+    const err = `Could not read any files: ${errors.join(", ")}`;
+    logError("analyze_project", err);
+    return { success: false, error: err };
+  }
+
+  let prompt = `Analyze the following project files and answer this question: ${question}`;
+  if (focus) {
+    prompt += `\n\nFocus specifically on: ${focus}`;
+  }
+  if (errors.length > 0) {
+    prompt += `\n\nNote: Some files could not be read: ${errors.join(", ")}`;
+  }
+  prompt += "\n\nProvide a detailed analysis with specific code references where relevant.";
+
+  const result = await runGemini(prompt, { stdin: content });
+
+  if (result.success) {
+    logSuccess("analyze_project", result.output);
+    return {
+      success: true,
+      analysis: result.output,
+      files_read: file_paths.length - errors.length,
+    };
+  }
+  logError("analyze_project", result.error || "Unknown error");
+  return { success: false, error: result.error };
+}
+
+/**
+ * Evaluate multiple implementation approaches or design decisions.
+ * Reads relevant files and provides reasoned recommendations.
+ *
+ * @param args.problem - The problem or decision to evaluate
+ * @param args.options - Array of options to consider
+ * @param args.file_paths - Optional file paths for context
+ * @param args.criteria - Optional criteria to evaluate against (performance, maintainability, etc.)
+ */
+export async function evaluate_options(args: {
+  problem: string;
+  options: string[];
+  file_paths?: string[];
+  criteria?: string[];
+}): Promise<{ success: boolean; evaluation?: string; recommendation?: string; error?: string }> {
+  logCall("evaluate_options", args);
+  const { problem, options, file_paths, criteria } = args;
+
+  if (!options || options.length < 2) {
+    const err = "At least 2 options required for evaluation";
+    logError("evaluate_options", err);
+    return { success: false, error: err };
+  }
+
+  let context = "";
+  if (file_paths && file_paths.length > 0) {
+    const { content, errors } = await readFilesWithLabels(file_paths);
+    if (content) {
+      context = `\n\nProject Context (from files):\n${content}`;
+    }
+    if (errors.length > 0) {
+      context += `\n\nNote: Some files could not be read: ${errors.join(", ")}`;
+    }
+  }
+
+  const optionsText = options.map((opt, i) => `${i + 1}. ${opt}`).join("\n");
+  let prompt = `Evaluate these options for the following problem:\n\nProblem: ${problem}\n\nOptions:\n${optionsText}`;
+
+  if (criteria && criteria.length > 0) {
+    prompt += `\n\nEvaluate against these criteria:\n${criteria.map(c => `- ${c}`).join("\n")}`;
+  }
+
+  prompt += context;
+  prompt += `\n\nFor each option:
+1. List pros and cons
+2. Consider how it fits with the existing codebase (if context provided)
+3. Identify potential risks or gotchas
+4. Rate suitability (1-10)
+
+End with a clear recommendation and reasoning.`;
+
+  const result = await runGemini(prompt);
+
+  if (result.success) {
+    logSuccess("evaluate_options", result.output);
+    // Try to extract the recommendation (usually at the end)
+    const lines = result.output.split("\n");
+    const recIdx = lines.findIndex(l =>
+      l.toLowerCase().includes("recommend") || l.toLowerCase().includes("conclusion")
+    );
+    const recommendation = recIdx >= 0 ? lines.slice(recIdx).join("\n") : undefined;
+
+    return {
+      success: true,
+      evaluation: result.output,
+      recommendation,
+    };
+  }
+  logError("evaluate_options", result.error || "Unknown error");
+  return { success: false, error: result.error };
+}
+
+/**
+ * Plan an implementation by analyzing existing code and proposing a detailed approach.
+ * Great for feature planning, refactoring, or migration planning.
+ *
+ * @param args.goal - What you want to achieve
+ * @param args.file_paths - Files to analyze for context
+ * @param args.constraints - Optional constraints or requirements
+ * @param args.style - Planning style: "detailed" for step-by-step, "high-level" for overview
+ */
+export async function plan_implementation(args: {
+  goal: string;
+  file_paths: string[];
+  constraints?: string[];
+  style?: "detailed" | "high-level";
+}): Promise<{ success: boolean; plan?: string; steps?: string[]; error?: string }> {
+  logCall("plan_implementation", args);
+  const { goal, file_paths, constraints, style = "detailed" } = args;
+
+  const { content, errors } = await readFilesWithLabels(file_paths);
+
+  if (!content) {
+    const err = `Could not read any files: ${errors.join(", ")}`;
+    logError("plan_implementation", err);
+    return { success: false, error: err };
+  }
+
+  let prompt = `I need to: ${goal}\n\nAnalyze the following codebase and create an implementation plan.`;
+
+  if (constraints && constraints.length > 0) {
+    prompt += `\n\nConstraints/Requirements:\n${constraints.map(c => `- ${c}`).join("\n")}`;
+  }
+
+  if (style === "detailed") {
+    prompt += `\n\nProvide a detailed implementation plan with:
+1. Understanding: Key insights from analyzing the existing code
+2. Approach: Overall strategy and rationale
+3. Steps: Numbered, actionable steps with specific file changes
+4. Files to Modify: List each file and what changes are needed
+5. New Files: Any new files that need to be created
+6. Testing: How to verify the implementation
+7. Risks: Potential issues and how to mitigate them`;
+  } else {
+    prompt += `\n\nProvide a high-level implementation plan with:
+1. Key architectural decisions
+2. Major components/modules to create or modify
+3. Integration points with existing code
+4. High-level milestones`;
+  }
+
+  if (errors.length > 0) {
+    prompt += `\n\nNote: Some files could not be read: ${errors.join(", ")}`;
+  }
+
+  const result = await runGemini(prompt, { stdin: content });
+
+  if (result.success) {
+    logSuccess("plan_implementation", result.output);
+
+    // Try to extract steps from the output
+    const stepMatches = result.output.match(/^\s*\d+\.\s+.+$/gm);
+    const steps = stepMatches ? stepMatches.map(s => s.trim()) : undefined;
+
+    return {
+      success: true,
+      plan: result.output,
+      steps,
+    };
+  }
+  logError("plan_implementation", result.error || "Unknown error");
+  return { success: false, error: result.error };
+}
+
+/**
+ * Review code for potential issues, improvements, and best practices.
+ * Comprehensive code review using Gemini's understanding.
+ *
+ * @param args.file_paths - Files to review
+ * @param args.focus - Focus areas: "security", "performance", "maintainability", "all"
+ * @param args.severity_threshold - Minimum severity to report: "critical", "warning", "info"
+ */
+export async function review_code(args: {
+  file_paths: string[];
+  focus?: "security" | "performance" | "maintainability" | "all";
+  severity_threshold?: "critical" | "warning" | "info";
+}): Promise<{
+  success: boolean;
+  review?: string;
+  issues_found?: number;
+  error?: string;
+}> {
+  logCall("review_code", args);
+  const { file_paths, focus = "all", severity_threshold = "warning" } = args;
+
+  const { content, errors } = await readFilesWithLabels(file_paths);
+
+  if (!content) {
+    const err = `Could not read any files: ${errors.join(", ")}`;
+    logError("review_code", err);
+    return { success: false, error: err };
+  }
+
+  let focusAreas = "";
+  if (focus === "security") {
+    focusAreas = "Focus on security vulnerabilities: injection attacks, authentication issues, data exposure, insecure dependencies.";
+  } else if (focus === "performance") {
+    focusAreas = "Focus on performance issues: inefficient algorithms, memory leaks, unnecessary computations, N+1 queries.";
+  } else if (focus === "maintainability") {
+    focusAreas = "Focus on maintainability: code clarity, proper abstractions, documentation, testability, coupling.";
+  } else {
+    focusAreas = "Review for security, performance, maintainability, and best practices.";
+  }
+
+  const severityDesc =
+    severity_threshold === "critical"
+      ? "Only report critical issues that must be fixed."
+      : severity_threshold === "warning"
+      ? "Report critical and warning-level issues."
+      : "Report all issues including minor suggestions.";
+
+  const prompt = `Perform a code review on the following files.
+
+${focusAreas}
+
+${severityDesc}
+
+For each issue found, provide:
+1. **Location**: File and line number/function
+2. **Severity**: Critical/Warning/Info
+3. **Issue**: What's wrong
+4. **Impact**: Why it matters
+5. **Fix**: How to resolve it
+
+End with a summary of the overall code quality and key recommendations.`;
+
+  const result = await runGemini(prompt, { stdin: content });
+
+  if (result.success) {
+    logSuccess("review_code", result.output);
+
+    // Count issues by looking for severity markers
+    const criticalCount = (result.output.match(/\*\*Critical\*\*/gi) || []).length;
+    const warningCount = (result.output.match(/\*\*Warning\*\*/gi) || []).length;
+    const infoCount = (result.output.match(/\*\*Info\*\*/gi) || []).length;
+    const issues_found = criticalCount + warningCount + infoCount;
+
+    return {
+      success: true,
+      review: result.output,
+      issues_found,
+    };
+  }
+  logError("review_code", result.error || "Unknown error");
+  return { success: false, error: result.error };
+}
+
+/**
+ * Reason through a complex problem considering the actual project context.
+ * Combines deep thinking with real code understanding.
+ *
+ * @param args.problem - The problem or question to reason through
+ * @param args.file_paths - Optional files to consider as context
+ * @param args.constraints - Optional constraints or requirements
+ * @param args.output_format - Optional format: "reasoning", "decision", "both"
+ */
+export async function reason_through(args: {
+  problem: string;
+  file_paths?: string[];
+  constraints?: string[];
+  output_format?: "reasoning" | "decision" | "both";
+}): Promise<{
+  success: boolean;
+  reasoning?: string;
+  decision?: string;
+  confidence?: string;
+  error?: string;
+}> {
+  logCall("reason_through", args);
+  const { problem, file_paths, constraints, output_format = "both" } = args;
+
+  let context = "";
+  if (file_paths && file_paths.length > 0) {
+    const { content, errors } = await readFilesWithLabels(file_paths);
+    if (content) {
+      context = `\n\nRelevant Code Context:\n${content}`;
+    }
+    if (errors.length > 0) {
+      context += `\n\nNote: Some files could not be read: ${errors.join(", ")}`;
+    }
+  }
+
+  let prompt = `Think through this problem carefully and systematically:\n\n${problem}`;
+
+  if (constraints && constraints.length > 0) {
+    prompt += `\n\nConstraints to consider:\n${constraints.map(c => `- ${c}`).join("\n")}`;
+  }
+
+  prompt += context;
+
+  prompt += `\n\nApproach this step by step:
+1. **Understanding**: Restate the problem in your own words
+2. **Key Considerations**: What factors are most important?
+3. **Analysis**: Examine each aspect carefully
+4. **Trade-offs**: What are the competing concerns?
+5. **Reasoning**: Work through the logic step by step
+6. **Conclusion**: Provide a clear decision/recommendation
+7. **Confidence**: Rate your confidence (high/medium/low) and explain why`;
+
+  const result = await runGemini(prompt);
+
+  if (result.success) {
+    logSuccess("reason_through", result.output);
+
+    // Try to extract decision and confidence
+    const lines = result.output.split("\n");
+    const conclusionIdx = lines.findIndex(
+      l => l.toLowerCase().includes("conclusion") || l.toLowerCase().includes("decision")
+    );
+    const confidenceIdx = lines.findIndex(l => l.toLowerCase().includes("confidence"));
+
+    const decision =
+      conclusionIdx >= 0
+        ? lines
+            .slice(conclusionIdx, confidenceIdx > conclusionIdx ? confidenceIdx : undefined)
+            .join("\n")
+        : undefined;
+
+    const confidence =
+      confidenceIdx >= 0 ? lines.slice(confidenceIdx, confidenceIdx + 2).join("\n") : undefined;
+
+    return {
+      success: true,
+      reasoning: result.output,
+      decision,
+      confidence,
+    };
+  }
+  logError("reason_through", result.error || "Unknown error");
+  return { success: false, error: result.error };
+}
+
+/**
+ * Trace data flow or execution flow through the codebase.
+ * Useful for understanding how data moves or debugging.
+ *
+ * @param args.starting_point - Where to start tracing (function, variable, endpoint)
+ * @param args.file_paths - Files to analyze
+ * @param args.trace_type - Type of trace: "data", "execution", "dependencies"
+ * @param args.question - Optional specific question about the flow
+ */
+export async function trace_flow(args: {
+  starting_point: string;
+  file_paths: string[];
+  trace_type?: "data" | "execution" | "dependencies";
+  question?: string;
+}): Promise<{ success: boolean; trace?: string; flow_summary?: string; error?: string }> {
+  logCall("trace_flow", args);
+  const { starting_point, file_paths, trace_type = "execution", question } = args;
+
+  const { content, errors } = await readFilesWithLabels(file_paths);
+
+  if (!content) {
+    const err = `Could not read any files: ${errors.join(", ")}`;
+    logError("trace_flow", err);
+    return { success: false, error: err };
+  }
+
+  let traceInstructions = "";
+  if (trace_type === "data") {
+    traceInstructions = `Trace how data flows through the system starting from "${starting_point}".
+Show:
+- Where the data originates
+- How it's transformed at each step
+- What functions/methods it passes through
+- Where it's ultimately used or stored`;
+  } else if (trace_type === "execution") {
+    traceInstructions = `Trace the execution flow starting from "${starting_point}".
+Show:
+- The entry point and initial state
+- Each function/method called in order
+- Decision points and branches
+- Side effects at each step
+- The final outcome`;
+  } else {
+    traceInstructions = `Trace the dependencies starting from "${starting_point}".
+Show:
+- What "${starting_point}" depends on directly
+- Transitive dependencies
+- External dependencies
+- Circular dependencies if any`;
+  }
+
+  let prompt = traceInstructions;
+  if (question) {
+    prompt += `\n\nSpecifically, answer this question: ${question}`;
+  }
+  if (errors.length > 0) {
+    prompt += `\n\nNote: Some files could not be read: ${errors.join(", ")}`;
+  }
+  prompt += "\n\nProvide the trace with specific code references (file:line where possible).";
+
+  const result = await runGemini(prompt, { stdin: content });
+
+  if (result.success) {
+    logSuccess("trace_flow", result.output);
+
+    // Extract a brief summary from the first paragraph
+    const paragraphs = result.output.split("\n\n");
+    const flow_summary = paragraphs[0];
+
+    return {
+      success: true,
+      trace: result.output,
+      flow_summary,
+    };
+  }
+  logError("trace_flow", result.error || "Unknown error");
+  return { success: false, error: result.error };
+}
