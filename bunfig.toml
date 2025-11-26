@@ -1,0 +1,6 @@
+# Bun configuration
+# https://bun.sh/docs/runtime/bunfig
+
+[test]
+# Timeout for tests in milliseconds (default: 5000)
+timeout = 10000
