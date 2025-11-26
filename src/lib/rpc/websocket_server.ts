@@ -84,17 +84,8 @@ export class WebSocketRpcServer {
       }
     });
 
-    // 4. Worker restarts
-    this.rpcCacheManager.onCacheRefreshed(async () => {
-      if (this.workerManager) {
-        const uniqueFiles = this.rpcCacheManager.getUniqueFiles();
-        await Promise.all(
-          Array.from(uniqueFiles.values()).map((file) =>
-            this.workerManager!.restartWorker(file.name, file)
-          )
-        );
-      }
-    });
+    // 4. Worker restarts - REMOVED: Now handled by targeted restarts in file watcher
+    // Old code restarted ALL workers on any change, causing CPU spikes
   }
 
   /**
@@ -148,9 +139,40 @@ export class WebSocketRpcServer {
     // Phase 5: Setup HTTP routes with OpenAPI documentation
     this.setupRoutes();
 
-    // Phase 7: Start file watcher
-    this.fileWatcherManager.startWatching(config.tools_dir, async () => {
+    // Phase 7: Start file watcher with targeted worker restarts
+    this.fileWatcherManager.startWatching(config.tools_dir, async (changedFiles) => {
+      if (!this.workerManager) return;
+
+      // 1. Capture state before refresh
+      const previousFiles = this.rpcCacheManager.getUniqueFiles();
+
+      // 2. Refresh cache (detects adds/removes)
       await this.rpcCacheManager.refreshCache();
+
+      // 3. Get new state
+      const currentFiles = this.rpcCacheManager.getUniqueFiles();
+
+      // 4. Handle Removals (files in previous but not current)
+      for (const [path, file] of previousFiles) {
+        if (!currentFiles.has(path)) {
+          console.error(`[Server] File removed: ${file.name}`);
+          await this.workerManager.stopWorker(file.name);
+        }
+      }
+
+      // 5. Handle Adds and Modifications
+      for (const [path, file] of currentFiles) {
+        const isNew = !previousFiles.has(path);
+        const isModified = changedFiles.has(path);
+
+        if (isNew) {
+          console.error(`[Server] New file detected: ${file.name}`);
+          await this.workerManager.startWorker(file);
+        } else if (isModified) {
+          console.error(`[Server] File modified: ${file.name}`);
+          await this.workerManager.restartWorker(file.name, file);
+        }
+      }
     });
 
     // Phase 8: Start HTTP server using Bun

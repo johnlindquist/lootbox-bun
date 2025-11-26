@@ -520,17 +520,15 @@ export class WorkerManager {
   }
 
   /**
-   * Restart a worker (for hot reload)
+   * Stop a worker process
    */
-  async restartWorker(workerId: string, file: RpcFile): Promise<void> {
+  async stopWorker(workerId: string): Promise<void> {
     const worker = this.workers.get(workerId);
+    if (!worker) return;
 
-    if (worker?.sendMessage) {
-      console.error(
-        `[WorkerManager] Shutting down worker ${workerId} for reload`
-      );
+    console.error(`[WorkerManager] Stopping worker ${workerId}`);
 
-      // Send shutdown signal
+    if (worker.sendMessage) {
       try {
         worker.sendMessage(JSON.stringify({ type: "shutdown" }));
       } catch {
@@ -539,20 +537,32 @@ export class WorkerManager {
 
       // Wait a bit for graceful shutdown
       await new Promise((resolve) => setTimeout(resolve, 500));
-
-      // Force kill if still alive
-      try {
-        worker.process.kill(9); // SIGKILL
-      } catch {
-        // Already dead
-      }
-
-      // Clean up
-      worker.sendMessage = undefined;
-      this.workers.delete(workerId);
     }
 
-    // Start new worker
+    // Force kill if still alive
+    try {
+      worker.process.kill(9); // SIGKILL
+    } catch {
+      // Already dead
+    }
+
+    // Reject any pending calls
+    for (const [callId, pending] of worker.pendingCalls) {
+      clearTimeout(pending.timeoutId);
+      pending.reject(new Error(`Worker ${workerId} stopped`));
+    }
+    worker.pendingCalls.clear();
+
+    // Clean up
+    worker.sendMessage = undefined;
+    this.workers.delete(workerId);
+  }
+
+  /**
+   * Restart a worker (for hot reload)
+   */
+  async restartWorker(workerId: string, file: RpcFile): Promise<void> {
+    await this.stopWorker(workerId);
     await this.startWorker(file);
   }
 
