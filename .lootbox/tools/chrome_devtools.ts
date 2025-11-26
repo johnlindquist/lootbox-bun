@@ -6,6 +6,9 @@
  */
 
 import { spawn, ChildProcess } from "node:child_process";
+import { readFileSync, readdirSync, existsSync } from "node:fs";
+import { join } from "node:path";
+import { homedir } from "node:os";
 import { createLogger, extractErrorMessage } from "./shared/index.ts";
 
 // Create logger for this tool
@@ -25,6 +28,464 @@ let serverInitialized = false;
 let initializationPromise: Promise<boolean> | null = null;
 let responseBuffer = "";
 
+// Profile configuration
+let currentProfileEmail: string | null = null;
+
+// Browser connection configuration
+let browserUrl: string | null = null;
+const DEFAULT_DEBUG_PORT = 9222;
+
+/**
+ * Check if Chrome is running with remote debugging enabled on the specified port
+ */
+async function checkChromeDebugPort(port: number = DEFAULT_DEBUG_PORT): Promise<boolean> {
+  try {
+    const response = await fetch(`http://127.0.0.1:${port}/json/version`, {
+      signal: AbortSignal.timeout(2000),
+    });
+    return response.ok;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Get Chrome executable path for the current platform
+ */
+function getChromeExecutable(): string {
+  if (process.platform === "darwin") {
+    return "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
+  } else if (process.platform === "win32") {
+    return "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe";
+  } else {
+    return "google-chrome";
+  }
+}
+
+/**
+ * Launch Chrome with remote debugging enabled
+ * NOTE: Chrome doesn't allow remote debugging on its default data directory
+ * So we always use a separate directory for debugging sessions
+ */
+async function launchChromeWithDebugging(
+  profileDir: string | null,
+  port: number = DEFAULT_DEBUG_PORT
+): Promise<{ success: boolean; error?: string }> {
+  try {
+    log.info(`Launching Chrome with debugging on port ${port}...`);
+
+    // Chrome requires a separate user-data-dir for remote debugging
+    // It won't work with the standard Chrome data directory
+    const debugDataDir = join(homedir(), ".chrome-debug-profile");
+
+    const chromeArgs = [
+      `--remote-debugging-port=${port}`,
+      "--no-first-run",
+      "--no-default-browser-check",
+      `--user-data-dir=${debugDataDir}`,
+    ];
+
+    if (profileDir) {
+      log.info(`Note: Profile "${profileDir}" specified but debugging requires separate data dir. You may need to log in again.`);
+    }
+
+    const chromePath = getChromeExecutable();
+    log.info(`Launching: ${chromePath} with data dir: ${debugDataDir}`);
+
+    const chrome = spawn(chromePath, chromeArgs, {
+      detached: true,
+      stdio: "ignore",
+    });
+    chrome.unref();
+
+    // Wait for Chrome to start and debugging port to be available
+    for (let i = 0; i < 20; i++) {
+      await new Promise((r) => setTimeout(r, 500));
+      if (await checkChromeDebugPort(port)) {
+        log.info(`Chrome debugging available on port ${port}`);
+        return { success: true };
+      }
+    }
+
+    return { success: false, error: "Chrome started but debugging port not available. Try closing all Chrome instances first." };
+  } catch (err) {
+    return { success: false, error: extractErrorMessage(err) };
+  }
+}
+
+/**
+ * Get the Chrome user data directory for the current platform
+ */
+function getChromeUserDataDir(): string {
+  const home = homedir();
+  if (process.platform === "darwin") {
+    return join(home, "Library", "Application Support", "Google", "Chrome");
+  } else if (process.platform === "win32") {
+    return join(home, "AppData", "Local", "Google", "Chrome", "User Data");
+  } else {
+    // Linux
+    return join(home, ".config", "google-chrome");
+  }
+}
+
+/**
+ * Find the profile directory name that matches a given email address
+ * @param email - The Gmail address to search for (e.g., "user@gmail.com")
+ * @returns The profile directory name (e.g., "Profile 1") or null if not found
+ */
+function findProfileByEmail(email: string): string | null {
+  const userDataDir = getChromeUserDataDir();
+
+  if (!existsSync(userDataDir)) {
+    log.info(`Chrome user data directory not found: ${userDataDir}`);
+    return null;
+  }
+
+  const entries = readdirSync(userDataDir, { withFileTypes: true });
+  const profileDirs = entries
+    .filter((e) => e.isDirectory())
+    .filter((e) => e.name === "Default" || e.name.startsWith("Profile "))
+    .map((e) => e.name);
+
+  for (const profileDir of profileDirs) {
+    const prefsPath = join(userDataDir, profileDir, "Preferences");
+    if (!existsSync(prefsPath)) {
+      continue;
+    }
+
+    try {
+      const prefs = JSON.parse(readFileSync(prefsPath, "utf-8"));
+      // Check account_info array for matching email
+      const accountInfo = prefs?.account_info;
+      if (Array.isArray(accountInfo)) {
+        for (const account of accountInfo) {
+          if (account?.email?.toLowerCase() === email.toLowerCase()) {
+            log.info(`Found profile "${profileDir}" for email "${email}"`);
+            return profileDir;
+          }
+        }
+      }
+      // Also check google.services.account_id or signin.email
+      const signinEmail = prefs?.signin?.email || prefs?.google?.services?.username;
+      if (signinEmail?.toLowerCase() === email.toLowerCase()) {
+        log.info(`Found profile "${profileDir}" for email "${email}"`);
+        return profileDir;
+      }
+    } catch (err) {
+      // Skip profiles with invalid/unreadable preferences
+      continue;
+    }
+  }
+
+  log.info(`No profile found for email "${email}"`);
+  return null;
+}
+
+/**
+ * Set the Chrome profile to use for the session by email address
+ * If the server is already running with a different profile, it will be restarted
+ * @param args.email - Gmail address to use (e.g., "user@gmail.com")
+ */
+export async function set_profile(args: {
+  email: string;
+}): Promise<{ success: boolean; result?: string; error?: string }> {
+  log.call("set_profile", args);
+
+  const { email } = args;
+
+  // Check if profile exists
+  const profileDir = findProfileByEmail(email);
+  if (!profileDir) {
+    const error = `No Chrome profile found for email "${email}". Make sure you have signed into Chrome with this account.`;
+    log.error("set_profile", error);
+    return { success: false, error };
+  }
+
+  // If server is running with different profile, restart it
+  if (serverInitialized && currentProfileEmail !== email) {
+    log.info(`Profile changed from "${currentProfileEmail}" to "${email}", restarting server...`);
+    await stopMcpServer();
+  }
+
+  currentProfileEmail = email;
+  const result = `Profile set to "${email}" (using Chrome profile directory: ${profileDir})`;
+  log.success("set_profile", result);
+  return { success: true, result };
+}
+
+/**
+ * Connect to an existing Chrome browser at a specific debugging URL
+ * Use this when you have Chrome running with --remote-debugging-port
+ * @param args.url - The debugging URL (e.g., "http://127.0.0.1:9222")
+ */
+export async function connect_browser(args: {
+  url: string;
+}): Promise<{ success: boolean; result?: string; error?: string }> {
+  log.call("connect_browser", args);
+
+  const { url } = args;
+
+  // Validate URL format
+  try {
+    new URL(url);
+  } catch {
+    const error = `Invalid URL format: ${url}`;
+    log.error("connect_browser", error);
+    return { success: false, error };
+  }
+
+  // Check if the debugging endpoint is accessible
+  try {
+    const response = await fetch(`${url}/json/version`, {
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!response.ok) {
+      const error = `Chrome debugging endpoint not accessible at ${url}`;
+      log.error("connect_browser", error);
+      return { success: false, error };
+    }
+  } catch (err) {
+    const error = `Cannot connect to Chrome at ${url}: ${extractErrorMessage(err)}`;
+    log.error("connect_browser", error);
+    return { success: false, error };
+  }
+
+  // If server is running, restart it with new URL
+  if (serverInitialized) {
+    log.info("Restarting server with new browser URL...");
+    await stopMcpServer();
+  }
+
+  browserUrl = url;
+  currentProfileEmail = null; // Clear profile when connecting directly
+
+  const result = `Connected to browser at ${url}`;
+  log.success("connect_browser", result);
+  return { success: true, result };
+}
+
+/**
+ * Check if Chrome is running (any instance)
+ */
+async function isChromeRunning(): Promise<boolean> {
+  const { execSync } = await import("node:child_process");
+  try {
+    if (process.platform === "darwin") {
+      const result = execSync("pgrep -x 'Google Chrome'", { encoding: "utf-8" });
+      return result.trim().length > 0;
+    } else if (process.platform === "win32") {
+      const result = execSync("tasklist /FI \"IMAGENAME eq chrome.exe\"", { encoding: "utf-8" });
+      return result.includes("chrome.exe");
+    } else {
+      const result = execSync("pgrep -x chrome", { encoding: "utf-8" });
+      return result.trim().length > 0;
+    }
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Kill all Chrome processes
+ */
+async function killChrome(): Promise<void> {
+  const { execSync } = await import("node:child_process");
+  try {
+    if (process.platform === "darwin") {
+      execSync("pkill -9 'Google Chrome'", { encoding: "utf-8" });
+    } else if (process.platform === "win32") {
+      execSync("taskkill /F /IM chrome.exe", { encoding: "utf-8" });
+    } else {
+      execSync("pkill -9 chrome", { encoding: "utf-8" });
+    }
+    // Wait for Chrome to fully close
+    await new Promise((r) => setTimeout(r, 1000));
+  } catch {
+    // Ignore errors if no Chrome was running
+  }
+}
+
+/**
+ * Launch Chrome with remote debugging enabled for the current profile
+ * This allows connecting to Chrome with your logged-in profile
+ * @param args.port - Optional debugging port (default: 9222)
+ * @param args.restart - If true, will kill existing Chrome and restart with debugging
+ */
+export async function launch_browser(args: {
+  port?: number;
+  restart?: boolean;
+}): Promise<{ success: boolean; result?: string; error?: string }> {
+  log.call("launch_browser", args);
+
+  const port = args.port || DEFAULT_DEBUG_PORT;
+  const restart = args.restart ?? false;
+  const profileDir = currentProfileEmail ? findProfileByEmail(currentProfileEmail) : null;
+
+  // Check if debug port is already available
+  if (await checkChromeDebugPort(port)) {
+    const result = `Chrome already running with debugging on port ${port}`;
+    log.success("launch_browser", result);
+    browserUrl = `http://127.0.0.1:${port}`;
+    return { success: true, result };
+  }
+
+  // Check if Chrome is running without debugging
+  const chromeRunning = await isChromeRunning();
+  if (chromeRunning && !restart) {
+    const error = `Chrome is running but without remote debugging. Use restart=true to restart Chrome with debugging enabled, or manually restart Chrome with: --remote-debugging-port=${port}`;
+    log.error("launch_browser", error);
+    return { success: false, error };
+  }
+
+  // Kill existing Chrome if restart is requested
+  if (chromeRunning && restart) {
+    log.info("Killing existing Chrome to restart with debugging...");
+    await killChrome();
+  }
+
+  // Launch Chrome with debugging
+  const launchResult = await launchChromeWithDebugging(profileDir, port);
+
+  if (!launchResult.success) {
+    log.error("launch_browser", launchResult.error || "Failed to launch Chrome");
+    return { success: false, error: launchResult.error };
+  }
+
+  // Restart MCP server if running
+  if (serverInitialized) {
+    await stopMcpServer();
+  }
+
+  browserUrl = `http://127.0.0.1:${port}`;
+  const profileInfo = profileDir ? ` with profile "${profileDir}"` : "";
+  const result = `Chrome launched${profileInfo} with debugging on port ${port}`;
+  log.success("launch_browser", result);
+  return { success: true, result };
+}
+
+/**
+ * Clear the current profile setting (use default Chrome profile)
+ */
+export async function clear_profile(args: Record<string, never> = {}): Promise<{
+  success: boolean;
+  result?: string;
+  error?: string;
+}> {
+  log.call("clear_profile", args);
+
+  if (serverInitialized && currentProfileEmail !== null) {
+    log.info("Clearing profile, restarting server...");
+    await stopMcpServer();
+  }
+
+  currentProfileEmail = null;
+  const result = "Profile cleared, will use default Chrome profile";
+  log.success("clear_profile", result);
+  return { success: true, result };
+}
+
+/**
+ * Get the current profile setting
+ */
+export async function get_profile(args: Record<string, never> = {}): Promise<{
+  success: boolean;
+  result?: { email: string | null; profileDir: string | null };
+  error?: string;
+}> {
+  log.call("get_profile", args);
+
+  const profileDir = currentProfileEmail
+    ? findProfileByEmail(currentProfileEmail)
+    : null;
+
+  return {
+    success: true,
+    result: {
+      email: currentProfileEmail,
+      profileDir,
+    },
+  };
+}
+
+/**
+ * List all available Chrome profiles with their associated email addresses
+ */
+export async function list_profiles(args: Record<string, never> = {}): Promise<{
+  success: boolean;
+  result?: Array<{ profileDir: string; email: string | null; name: string | null }>;
+  error?: string;
+}> {
+  log.call("list_profiles", args);
+
+  const userDataDir = getChromeUserDataDir();
+
+  if (!existsSync(userDataDir)) {
+    return {
+      success: false,
+      error: `Chrome user data directory not found: ${userDataDir}`,
+    };
+  }
+
+  const profiles: Array<{ profileDir: string; email: string | null; name: string | null }> = [];
+
+  try {
+    const entries = readdirSync(userDataDir, { withFileTypes: true });
+    const profileDirs = entries
+      .filter((e) => e.isDirectory())
+      .filter((e) => e.name === "Default" || e.name.startsWith("Profile "))
+      .map((e) => e.name);
+
+    for (const profileDir of profileDirs) {
+      const prefsPath = join(userDataDir, profileDir, "Preferences");
+      let email: string | null = null;
+      let name: string | null = null;
+
+      if (existsSync(prefsPath)) {
+        try {
+          const prefs = JSON.parse(readFileSync(prefsPath, "utf-8"));
+          // Get profile name
+          name = prefs?.profile?.name || null;
+          // Get email from account_info
+          const accountInfo = prefs?.account_info;
+          if (Array.isArray(accountInfo) && accountInfo.length > 0) {
+            email = accountInfo[0]?.email || null;
+          }
+          // Fallback to signin email
+          if (!email) {
+            email = prefs?.signin?.email || prefs?.google?.services?.username || null;
+          }
+        } catch {
+          // Skip profiles with invalid preferences
+        }
+      }
+
+      profiles.push({ profileDir, email, name });
+    }
+
+    log.success("list_profiles", `Found ${profiles.length} profiles`);
+    return { success: true, result: profiles };
+  } catch (err) {
+    const error = extractErrorMessage(err);
+    log.error("list_profiles", error);
+    return { success: false, error };
+  }
+}
+
+/**
+ * Stop the MCP server process
+ */
+async function stopMcpServer(): Promise<void> {
+  if (mcpProcess && !mcpProcess.killed) {
+    log.info("Stopping MCP server...");
+    mcpProcess.kill();
+    mcpProcess = null;
+  }
+  serverInitialized = false;
+  initializationPromise = null;
+  pendingRequests.clear();
+  responseBuffer = "";
+}
+
 /**
  * Start the Chrome DevTools MCP server process
  */
@@ -41,7 +502,41 @@ async function ensureMcpServer(): Promise<boolean> {
     try {
       log.info("Starting Chrome DevTools MCP server...");
 
-      mcpProcess = spawn("npx", ["chrome-devtools-mcp@latest"], {
+      // Build command arguments
+      const args = ["chrome-devtools-mcp@latest"];
+
+      // If a profile is set, we need to connect to Chrome with that profile
+      if (currentProfileEmail) {
+        const profileDir = findProfileByEmail(currentProfileEmail);
+        if (profileDir) {
+          log.info(`Using Chrome profile: ${profileDir} (${currentProfileEmail})`);
+
+          // Check if Chrome is already running with debug port
+          const debugAvailable = await checkChromeDebugPort(DEFAULT_DEBUG_PORT);
+
+          if (debugAvailable) {
+            // Connect to existing Chrome instance
+            log.info(`Connecting to existing Chrome on port ${DEFAULT_DEBUG_PORT}`);
+            args.push(`--browserUrl=http://127.0.0.1:${DEFAULT_DEBUG_PORT}`);
+          } else {
+            // Try to launch Chrome with the profile and debug port
+            log.info("No Chrome debug port available, launching Chrome with profile...");
+            const launchResult = await launchChromeWithDebugging(profileDir, DEFAULT_DEBUG_PORT);
+
+            if (launchResult.success) {
+              args.push(`--browserUrl=http://127.0.0.1:${DEFAULT_DEBUG_PORT}`);
+            } else {
+              // Fall back to chrome-devtools-mcp launching its own browser
+              log.info(`Failed to launch Chrome with profile: ${launchResult.error}. Using default browser.`);
+            }
+          }
+        }
+      } else if (browserUrl) {
+        // Use explicitly set browser URL
+        args.push(`--browserUrl=${browserUrl}`);
+      }
+
+      mcpProcess = spawn("npx", args, {
         stdio: ["pipe", "pipe", "pipe"],
         env: { ...process.env },
       });
@@ -546,17 +1041,45 @@ export async function get_network_request(args: {
 
 /**
  * Execute JavaScript code in the page context
- * @param args.script - JavaScript code to execute
- * @param args.returnByValue - Optional whether to return the result value
- * @param args.pageId - Optional specific page to execute on
+ * The MCP tool expects a function declaration string (e.g., "() => document.title")
+ * If you provide a plain expression, it will be wrapped in an arrow function automatically
+ * @param args.script - JavaScript code to execute (will be auto-wrapped if not a function declaration)
+ * @param args.function - Alternative: provide a function declaration directly
+ * @param args.args - Optional array of element UIDs to pass as arguments
  */
 export async function evaluate_script(args: {
-  script: string;
-  returnByValue?: boolean;
-  pageId?: string;
+  script?: string;
+  function?: string;
+  args?: Array<{ uid: string }>;
 }): Promise<{ success: boolean; result?: unknown; error?: string }> {
   log.call("evaluate_script", args);
-  const result = await callTool("evaluate_script", args);
+
+  let functionStr = args.function || args.script || "";
+
+  // If the input doesn't look like a function declaration, wrap it in one
+  const trimmed = functionStr.trim();
+  const isFunction =
+    trimmed.startsWith("()") ||
+    trimmed.startsWith("async ()") ||
+    trimmed.startsWith("function") ||
+    trimmed.startsWith("(") && trimmed.includes("=>") ||
+    trimmed.startsWith("async (");
+
+  if (!isFunction && functionStr) {
+    // Wrap plain expressions in an arrow function
+    functionStr = `() => (${functionStr})`;
+    log.info(`Wrapped script as function: ${functionStr}`);
+  }
+
+  const toolArgs: Record<string, unknown> = {
+    function: functionStr,
+  };
+
+  if (args.args && args.args.length > 0) {
+    toolArgs.args = args.args;
+  }
+
+  const result = await callTool("evaluate_script", toolArgs);
   if (result.success) {
     log.success("evaluate_script", result.result);
   } else {
