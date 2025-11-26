@@ -52,12 +52,22 @@ export class ConnectionManager {
    */
   broadcastToClients(message: object): void {
     const messageStr = JSON.stringify(message);
+    // Broadcast to Hono WebSocket clients
     for (const client of this.clients) {
       try {
         client.send(messageStr);
       } catch (err) {
         console.error("Failed to send message to client:", err);
         this.clients.delete(client);
+      }
+    }
+    // Broadcast to Bun native WebSocket clients
+    for (const client of this.bunClients) {
+      try {
+        client.send(messageStr);
+      } catch (err) {
+        console.error("Failed to send message to bun client:", err);
+        this.bunClients.delete(client);
       }
     }
   }
@@ -139,8 +149,8 @@ export class ConnectionManager {
         return;
       }
 
-      // If it's from a worker (ready, result, error, crash messages)
-      if (parsed.type === "ready" || parsed.type === "result" || parsed.type === "error" || parsed.type === "crash") {
+      // If it's from a worker (ready, result, error, crash, progress messages)
+      if (parsed.type === "ready" || parsed.type === "result" || parsed.type === "error" || parsed.type === "crash" || parsed.type === "progress") {
         workerManager.handleMessage(data);
         return;
       }

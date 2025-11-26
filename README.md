@@ -72,22 +72,7 @@ bun run src/lootbox-cli.ts tools types kv,sqlite,memory
 bun run src/lootbox-cli.ts scripts
 ```
 
-### 4. Create Your Tools
-
-Create TypeScript files in `.lootbox/tools/`:
-
-```typescript
-// .lootbox/tools/myapi.ts
-export async function processData(args: {
-  items: string[];
-  threshold: number;
-}): Promise<{ processed: number; results: string[] }> {
-  const results = args.items.filter((item) => item.length > args.threshold);
-  return { processed: results.length, results };
-}
-```
-
-### 5. Execute Scripts
+### 4. Execute Scripts
 
 ```bash
 # Execute inline code
@@ -128,25 +113,144 @@ bun run src/lootbox-cli.ts server --port 3456
 
 3. Your lootbox tools will now be available in Claude Code with the format `namespace__function` (e.g., `basic_memory__write_memory`).
 
-## Example Tools
+## Included Tools
 
-The repository includes example tools that demonstrate common use cases. You can copy these to your own `.lootbox/tools/` directory:
-
-**Location in Repository**: `.lootbox/tools/`
+The repository includes several tools in `.lootbox/tools/` that demonstrate common use cases and provide useful functionality out of the box.
 
 ### Basic Memory Tool
 
-The included `basic_memory.ts` tool wraps the [basic-memory](https://github.com/basicmemory/basic-memory) CLI:
+**File**: `.lootbox/tools/basic_memory.ts`
 
+Wraps the [basic-memory](https://github.com/basicmemory/basic-memory) CLI for persistent, local-first knowledge management. Memories are stored as markdown files with semantic search capabilities.
+
+**Prerequisites**:
+```bash
+# Install basic-memory CLI (requires Python 3.10+)
+pip install basic-memory
+# or
+pipx install basic-memory
+```
+
+**Available Functions**:
 ```typescript
-// Available functions:
-await tools.basic_memory.write_memory({ title: "Meeting Notes", content: "..." })
+// Write a memory with title and markdown content
+await tools.basic_memory.write_memory({
+  title: "Meeting Notes",
+  content: "## Discussion\n...",
+  folder: "work",      // optional, default: "memories"
+  tags: "meeting,q4"   // optional comma-separated tags
+})
+
+// Read a memory by permalink
 await tools.basic_memory.read_memory({ permalink: "meeting-notes" })
-await tools.basic_memory.search_memories({ query: "meeting", limit: 10 })
-await tools.basic_memory.list_memories({ folder: "work" })
-await tools.basic_memory.delete_memory({ permalink: "old-note" })
+
+// Semantic search across memories
+await tools.basic_memory.search_memories({ query: "meeting", page_size: 10 })
+
+// List recent activity
+await tools.basic_memory.list_memories({})
+
+// Build context for a topic
+await tools.basic_memory.build_context({ topic: "project architecture" })
+
+// Sync and status
 await tools.basic_memory.sync_memories({})
 await tools.basic_memory.memory_status({})
+```
+
+---
+
+### DeepWiki Tool
+
+**File**: `.lootbox/tools/deepwiki.ts`
+
+Provides AI-powered documentation understanding for any public GitHub repository via the [DeepWiki](https://deepwiki.com) service. Useful for investigating how open-source libraries and frameworks work.
+
+**Prerequisites**:
+```bash
+# Requires @wong2/mcp-cli (installed automatically via bunx)
+# No manual installation needed - runs via bunx on first use
+```
+
+**Available Functions**:
+```typescript
+// Get documentation table of contents for a repo
+await tools.deepwiki.read_wiki_structure({ repo_name: "anthropics/claude-code" })
+
+// Get full documentation content
+await tools.deepwiki.read_wiki_contents({ repo_name: "facebook/react" })
+
+// Ask any question about a repository (AI-powered)
+await tools.deepwiki.ask_question({
+  repo_name: "vercel/next.js",
+  question: "How does the App Router handle server components?"
+})
+```
+
+**Typical Workflow**:
+1. Call `read_wiki_structure` first to see what documentation is available
+2. Call `read_wiki_contents` for comprehensive context
+3. Call `ask_question` for specific questions about the codebase
+
+---
+
+### MCP CLI Tool
+
+**File**: `.lootbox/tools/mcp_cli.ts`
+
+A wrapper for [@wong2/mcp-cli](https://github.com/wong2/mcp-cli) to investigate and interact with any MCP server. Useful for debugging MCP servers or accessing MCP endpoints that aren't configured locally.
+
+**Prerequisites**:
+```bash
+# Requires @wong2/mcp-cli (installed automatically via bunx)
+# No manual installation needed - runs via bunx on first use
+```
+
+**Available Functions**:
+```typescript
+// Call a tool on an MCP server via SSE endpoint
+await tools.mcp_cli.call_tool_sse({
+  endpoint: "https://mcp.deepwiki.com/sse",
+  tool_name: "read_wiki_structure",
+  tool_args: { repoName: "owner/repo" }
+})
+
+// Call a tool on an MCP server via HTTP endpoint
+await tools.mcp_cli.call_tool_http({
+  endpoint: "https://mcp.example.com/mcp",
+  tool_name: "some_tool",
+  tool_args: { key: "value" }
+})
+
+// Read a resource from an MCP server
+await tools.mcp_cli.read_resource_sse({
+  endpoint: "https://mcp.example.com/sse",
+  resource_uri: "resource://some-resource"
+})
+
+// Get a prompt from an MCP server
+await tools.mcp_cli.get_prompt_sse({
+  endpoint: "https://mcp.example.com/sse",
+  prompt_name: "my-prompt",
+  prompt_args: { context: "..." }
+})
+```
+
+---
+
+### Creating Your Own Tools
+
+Create TypeScript files in `.lootbox/tools/`:
+
+```typescript
+// .lootbox/tools/myapi.ts
+export async function processData(args: {
+  items: string[];
+  threshold: number;
+}): Promise<{ processed: number; results: string[] }> {
+  const results = args.items.filter((item) => item.length > args.threshold);
+  return { processed: results.length, results };
+}
 ```
 
 ## Script Management

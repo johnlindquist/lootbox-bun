@@ -74,15 +74,32 @@ async function main() {
             throw new Error(\`Function '\${functionName}' not found or not exported\`);
           }
 
-          // Execute with timeout
+          // Set up progress callback if the module supports it
+          // This allows long-running functions to send progress updates
+          if (typeof functions.setProgressCallback === "function") {
+            functions.setProgressCallback((message: string) => {
+              ws.send(JSON.stringify({
+                type: "progress",
+                id,
+                message,
+              }));
+            });
+          }
+
+          // Execute with extended timeout (5 minutes for streaming operations)
           const timeoutPromise = new Promise((_, reject) => {
-            setTimeout(() => reject(new Error("Function execution timeout (30s)")), 30000);
+            setTimeout(() => reject(new Error("Function execution timeout (5m)")), 300000);
           });
 
           const result = await Promise.race([
             fn(args),
             timeoutPromise,
           ]);
+
+          // Clear progress callback
+          if (typeof functions.setProgressCallback === "function") {
+            functions.setProgressCallback(null);
+          }
 
           // Send result back
           ws.send(JSON.stringify({
@@ -91,6 +108,11 @@ async function main() {
             data: result,
           }));
         } catch (error) {
+          // Clear progress callback on error
+          if (typeof functions.setProgressCallback === "function") {
+            functions.setProgressCallback(null);
+          }
+
           // Send error back
           ws.send(JSON.stringify({
             type: "error",
@@ -159,6 +181,9 @@ async function main() {
 main();
 `;
 
+// Progress callback type
+type ProgressCallback = (callId: string, message: string) => void;
+
 interface WorkerState {
   process: Subprocess;
   sendMessage?: (message: string) => void; // Callback to send messages to worker
@@ -171,6 +196,7 @@ interface WorkerState {
       resolve: (value: unknown) => void;
       reject: (error: Error) => void;
       timeoutId: ReturnType<typeof setTimeout>;
+      clientCallId?: string; // Original call ID from client for progress routing
     }
   >;
   restartCount: number;
@@ -205,19 +231,35 @@ interface CrashMessage {
   error: string;
 }
 
+interface ProgressMessage {
+  type: "progress";
+  id: string;
+  message: string;
+}
+
 type WorkerIncomingMessage =
   | IdentifyMessage
   | ReadyMessage
   | ResultMessage
   | ErrorMessage
-  | CrashMessage;
+  | CrashMessage
+  | ProgressMessage;
 
 export class WorkerManager {
   private workers = new Map<string, WorkerState>();
   private port: number;
+  private progressCallback?: ProgressCallback;
 
   constructor(port: number) {
     this.port = port;
+  }
+
+  /**
+   * Set a callback to receive progress updates from workers
+   * Progress updates include the original client call ID for routing
+   */
+  setProgressCallback(callback: ProgressCallback | undefined): void {
+    this.progressCallback = callback;
   }
 
   /**
@@ -323,6 +365,28 @@ export class WorkerManager {
             return;
           }
         }
+      } else if (msg.type === "progress") {
+        // Progress message - reset the timeout for the pending call
+        // This allows long-running operations to continue without timing out
+        for (const worker of this.workers.values()) {
+          const pending = worker.pendingCalls.get(msg.id);
+          if (pending) {
+            // Clear the old timeout and set a new one
+            clearTimeout(pending.timeoutId);
+            pending.timeoutId = setTimeout(() => {
+              worker.pendingCalls.delete(msg.id);
+              pending.reject(
+                new Error(`RPC call timeout after progress (no update for 60s)`)
+              );
+            }, 60000); // 60 second timeout after each progress update
+
+            // Forward progress to client using the original client call ID
+            if (this.progressCallback && pending.clientCallId) {
+              this.progressCallback(pending.clientCallId, msg.message);
+            }
+            return;
+          }
+        }
       } else if (msg.type === "crash") {
         // Find worker - we need to track which worker sent this
         // For now, log and let process monitoring handle it
@@ -345,11 +409,16 @@ export class WorkerManager {
 
   /**
    * Call a function on a worker
+   * @param namespace - The worker namespace (tool name)
+   * @param functionName - The function to call
+   * @param args - Arguments to pass to the function
+   * @param clientCallId - Optional original call ID from client for progress routing
    */
   async callFunction(
     namespace: string,
     functionName: string,
-    args: unknown
+    args: unknown,
+    clientCallId?: string
   ): Promise<unknown> {
     const worker = this.workers.get(namespace);
 
@@ -382,7 +451,7 @@ export class WorkerManager {
 
     // Create promise for response
     const resultPromise = new Promise<unknown>((resolve, reject) => {
-      // Timeout after 30 seconds
+      // Timeout after 30 seconds (will be extended on progress updates)
       const timeoutId = setTimeout(() => {
         worker.pendingCalls.delete(callId);
         reject(
@@ -392,7 +461,7 @@ export class WorkerManager {
         );
       }, 30000);
 
-      worker.pendingCalls.set(callId, { resolve, reject, timeoutId });
+      worker.pendingCalls.set(callId, { resolve, reject, timeoutId, clientCallId });
     });
 
     // Send call message

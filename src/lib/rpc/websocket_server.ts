@@ -133,6 +133,18 @@ export class WebSocketRpcServer {
       this.mcpIntegrationManager
     );
 
+    // Set up progress callback to forward progress messages to clients
+    // This enables long-running operations to send updates without timing out
+    const connectionManager = this.connectionManager;
+    this.workerManager.setProgressCallback((callId, message) => {
+      // Broadcast progress to all clients - the client with the matching callId will handle it
+      connectionManager.broadcastToClients({
+        type: "progress",
+        id: callId,
+        message,
+      });
+    });
+
     // Phase 5: Setup HTTP routes with OpenAPI documentation
     this.setupRoutes();
 
@@ -143,7 +155,6 @@ export class WebSocketRpcServer {
 
     // Phase 8: Start HTTP server using Bun
     const honoFetch = this.app.fetch.bind(this.app);
-    const connectionManager = this.connectionManager;
     const messageRouter = this.messageRouter;
     const rpcCacheManager = this.rpcCacheManager;
     const workerManager = this.workerManager!;

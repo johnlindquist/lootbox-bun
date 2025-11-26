@@ -5,10 +5,44 @@
  * knowledge management system that stores memories as markdown files.
  */
 
-import { $ } from "bun";
+import { $, file } from "bun";
+import { appendFileSync, mkdirSync, existsSync } from "node:fs";
+import { join } from "node:path";
 
 // Default project for basic-memory
 const DEFAULT_PROJECT = "memory";
+
+// Logging utilities - writes to file on disk
+const LOG_DIR = join(process.env.HOME || "/tmp", ".lootbox-logs");
+const LOG_FILE = join(LOG_DIR, "basic_memory.log");
+
+// Helper to append log (creates dir if needed)
+const writeLog = async (level: string, message: string) => {
+  try {
+    // Ensure directory exists
+    if (!existsSync(LOG_DIR)) {
+      mkdirSync(LOG_DIR, { recursive: true });
+    }
+    const timestamp = new Date().toISOString();
+    const line = `[${timestamp}] [${level}] ${message}\n`;
+    appendFileSync(LOG_FILE, line);
+  } catch (e) {
+    // Silent fail if logging fails
+  }
+};
+
+const logCall = async (fn: string, args: Record<string, unknown>) => {
+  await writeLog("CALL", `📞 ${fn}(${JSON.stringify(args)})`);
+};
+const logSuccess = async (fn: string, result: unknown) => {
+  const preview = typeof result === 'string'
+    ? result.substring(0, 200) + (result.length > 200 ? '...' : '')
+    : JSON.stringify(result).substring(0, 200);
+  await writeLog("SUCCESS", `✅ ${fn} → ${preview}`);
+};
+const logError = async (fn: string, error: string) => {
+  await writeLog("ERROR", `❌ ${fn} → ${error}`);
+};
 
 // Helper to run basic-memory tool commands
 async function runBasicMemoryTool(args: string[], project: string = DEFAULT_PROJECT): Promise<{ success: boolean; output: string; error?: string }> {
@@ -56,6 +90,7 @@ export async function write_memory(args: {
   folder?: string;
   tags?: string;
 }): Promise<{ success: boolean; permalink?: string; error?: string }> {
+  logCall("write_memory", args);
   const { title, content, folder = "memories", tags } = args;
 
   const cmdArgs = ["write-note", "--title", title, "--folder", folder, "--content", content];
@@ -66,8 +101,11 @@ export async function write_memory(args: {
   const result = await runBasicMemoryTool(cmdArgs);
 
   if (result.success) {
-    return { success: true, permalink: title.toLowerCase().replace(/\s+/g, "-") };
+    const permalink = title.toLowerCase().replace(/\s+/g, "-");
+    logSuccess("write_memory", { permalink });
+    return { success: true, permalink };
   }
+  logError("write_memory", result.error || "Unknown error");
   return { success: false, error: result.error };
 }
 
@@ -78,14 +116,17 @@ export async function write_memory(args: {
 export async function read_memory(args: {
   permalink: string;
 }): Promise<{ success: boolean; content?: string; error?: string }> {
+  logCall("read_memory", args);
   const { permalink } = args;
 
   // read-note takes IDENTIFIER as positional argument
   const result = await runBasicMemoryTool(["read-note", permalink]);
 
   if (result.success) {
+    logSuccess("read_memory", result.output);
     return { success: true, content: result.output };
   }
+  logError("read_memory", result.error || "Unknown error");
   return { success: false, error: result.error };
 }
 
@@ -98,6 +139,7 @@ export async function search_memories(args: {
   query: string;
   page_size?: number;
 }): Promise<{ success: boolean; results?: string; error?: string }> {
+  logCall("search_memories", args);
   const { query, page_size = 10 } = args;
 
   // search-notes takes QUERY as positional argument
@@ -105,8 +147,10 @@ export async function search_memories(args: {
   const result = await runBasicMemoryTool(cmdArgs);
 
   if (result.success) {
+    logSuccess("search_memories", result.output);
     return { success: true, results: result.output };
   }
+  logError("search_memories", result.error || "Unknown error");
   return { success: false, error: result.error };
 }
 
@@ -117,16 +161,21 @@ export async function search_memories(args: {
 export async function list_memories(args: {
   page_size?: number;
 }): Promise<{ success: boolean; memories?: string; error?: string }> {
+  logCall("list_memories", args);
   // recent-activity doesn't have --page-size or --project flags
   // It uses --depth (default: 1) and --timeframe (default: 7d)
   try {
     const result = await $`basic-memory tool recent-activity --depth 3 --timeframe 30d`.quiet();
-    return { success: true, memories: result.text() };
+    const output = result.text();
+    logSuccess("list_memories", output);
+    return { success: true, memories: output };
   } catch (error) {
     const err = error as { stderr?: { toString(): string }; message?: string };
+    const errorMsg = err.stderr?.toString() || err.message || String(error);
+    logError("list_memories", errorMsg);
     return {
       success: false,
-      error: err.stderr?.toString() || err.message || String(error)
+      error: errorMsg
     };
   }
 }
@@ -138,14 +187,17 @@ export async function list_memories(args: {
 export async function build_context(args: {
   topic: string;
 }): Promise<{ success: boolean; context?: string; error?: string }> {
+  logCall("build_context", args);
   const { topic } = args;
 
   // build-context takes TOPIC as positional argument
   const result = await runBasicMemoryTool(["build-context", topic]);
 
   if (result.success) {
+    logSuccess("build_context", result.output);
     return { success: true, context: result.output };
   }
+  logError("build_context", result.error || "Unknown error");
   return { success: false, error: result.error };
 }
 
@@ -153,11 +205,14 @@ export async function build_context(args: {
  * Sync the memory database
  */
 export async function sync_memories(args: Record<string, never> = {}): Promise<{ success: boolean; output?: string; error?: string }> {
+  logCall("sync_memories", {});
   const result = await runBasicMemory(["sync"]);
 
   if (result.success) {
+    logSuccess("sync_memories", result.output);
     return { success: true, output: result.output };
   }
+  logError("sync_memories", result.error || "Unknown error");
   return { success: false, error: result.error };
 }
 
@@ -165,10 +220,13 @@ export async function sync_memories(args: Record<string, never> = {}): Promise<{
  * Get memory database status
  */
 export async function memory_status(args: Record<string, never> = {}): Promise<{ success: boolean; status?: string; error?: string }> {
+  logCall("memory_status", {});
   const result = await runBasicMemory(["status"]);
 
   if (result.success) {
+    logSuccess("memory_status", result.output);
     return { success: true, status: result.output };
   }
+  logError("memory_status", result.error || "Unknown error");
   return { success: false, error: result.error };
 }

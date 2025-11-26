@@ -169,10 +169,12 @@ export class MessageRouter {
       const [namespace, functionName] = msg.method.split(".");
 
       try {
+        // Pass the client's call ID for progress routing
         const result = await this.workerManager.callFunction(
           namespace,
           functionName,
-          msg.args || {}
+          msg.args || {},
+          msg.id // Original client call ID for progress routing
         );
         response.result = result;
       } catch (error) {
