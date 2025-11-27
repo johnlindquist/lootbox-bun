@@ -16,6 +16,7 @@
  */
 
 import { createLogger, extractErrorMessage, type ProgressCallback } from "./shared/index.ts";
+import { saveToolResponse } from "./shared/response_history.ts";
 
 const log = createLogger("council");
 
@@ -501,13 +502,34 @@ export async function ask(args: {
   log.success("ask", { successCount, total_duration_ms });
   sendProgress(`Council complete: ${successCount}/${responses.length} responded`);
 
-  return {
+  const resultObj = {
     success: true,
     question,
     responses,
     total_duration_ms,
     summary,
   };
+
+  // Build markdown content for history
+  const historyContent = responses.map(r =>
+    `## ${r.agent}\n\n${r.success ? r.response : `**Error:** ${r.error}`}\n\n*Duration: ${(r.duration_ms / 1000).toFixed(1)}s*`
+  ).join("\n\n---\n\n");
+
+  try {
+    await saveToolResponse({
+      tool: "council",
+      topic: question.substring(0, 100),
+      content: historyContent,
+      query: question,
+      tags: ["council", ...(role_preset ? [role_preset] : [])],
+      duration_ms: total_duration_ms,
+      agents: responses.filter(r => r.success).map(r => r.agent),
+    });
+  } catch (e) {
+    log.warn("Failed to save response to history", e);
+  }
+
+  return resultObj;
 }
 
 /**

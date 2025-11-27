@@ -18,6 +18,7 @@
  */
 
 import { createLogger, extractErrorMessage, type ProgressCallback } from "./shared/index.ts";
+import { saveToolResponse } from "./shared/response_history.ts";
 
 const log = createLogger("deep_research");
 
@@ -469,7 +470,8 @@ Be specific, cite findings from the research, and distinguish between establishe
 
   log.success("deep_research", { topic, sections: sections.length, duration: total_duration_ms });
 
-  return {
+  // Save response to history
+  const resultObj = {
     success: true,
     topic,
     summary,
@@ -484,6 +486,26 @@ Be specific, cite findings from the research, and distinguish between establishe
     },
     total_duration_ms,
   };
+
+  // Build markdown content for history
+  const historyContent = `## Summary\n\n${summary}\n\n## Key Findings\n\n${key_findings.map(f => `- ${f}`).join("\n")}\n\n## Knowledge Gaps\n\n${knowledge_gaps.map(g => `- ${g}`).join("\n")}\n\n## Recommendations\n\n${recommendations.map(r => `- ${r}`).join("\n")}\n\n## Sections\n\n${sections.map(s => `### ${s.title}\n\n${s.content}`).join("\n\n")}`;
+
+  try {
+    await saveToolResponse({
+      tool: "deep_research",
+      topic,
+      content: historyContent,
+      query: focus || topic,
+      tags: ["research", depth],
+      duration_ms: total_duration_ms,
+      agents: successfulSyntheses.map((s) => s.agent),
+      extras: { depth, queries_executed: resultObj.methodology.queries_executed },
+    });
+  } catch (e) {
+    log.warn("Failed to save response to history", e);
+  }
+
+  return resultObj;
 }
 
 /**

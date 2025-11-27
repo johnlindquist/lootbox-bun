@@ -14,6 +14,7 @@
  */
 
 import { createLogger, extractErrorMessage, type ProgressCallback } from "./shared/index.ts";
+import { saveToolResponse } from "./shared/response_history.ts";
 
 const log = createLogger("brainstorm");
 
@@ -294,7 +295,7 @@ Format your response as a numbered list of distinct ideas. Be specific and actio
   log.success("generate", { mode, ideaCount: ideas.length, successCount });
   sendProgress(`Generated ${ideas.length} ideas from ${successCount} agents`);
 
-  return {
+  const resultObj = {
     success: successCount > 0,
     topic,
     mode: modeConfig.name,
@@ -302,6 +303,27 @@ Format your response as a numbered list of distinct ideas. Be specific and actio
     total_duration_ms,
     error: successCount === 0 ? "All agents failed" : undefined,
   };
+
+  // Save to history if successful
+  if (resultObj.success) {
+    const historyContent = `## Ideas (${modeConfig.name})\n\n${ideas.map((idea, i) => `${i + 1}. **[${idea.agent}]** ${idea.content}`).join("\n\n")}`;
+
+    try {
+      await saveToolResponse({
+        tool: "brainstorm",
+        topic,
+        content: historyContent,
+        tags: ["brainstorm", mode],
+        duration_ms: total_duration_ms,
+        agents: [...new Set(ideas.map(i => i.agent))],
+        extras: { mode, constraints, ideaCount: ideas.length },
+      });
+    } catch (e) {
+      log.warn("Failed to save response to history", e);
+    }
+  }
+
+  return resultObj;
 }
 
 /**

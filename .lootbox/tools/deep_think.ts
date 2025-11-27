@@ -19,6 +19,7 @@
  */
 
 import { createLogger, extractErrorMessage, type ProgressCallback } from "./shared/index.ts";
+import { saveToolResponse } from "./shared/response_history.ts";
 
 const log = createLogger("deep_think");
 
@@ -490,7 +491,7 @@ Synthesize these perspectives into a coherent analysis. Provide:
 
   log.success("deep_think", { problem: problem.substring(0, 50), threads: reasoning_threads.length, duration: total_duration_ms });
 
-  return {
+  const resultObj = {
     success: true,
     problem,
     synthesis: synthesisResult.reasoning || "",
@@ -507,6 +508,26 @@ Synthesize these perspectives into a coherent analysis. Provide:
     },
     total_duration_ms,
   };
+
+  // Build markdown content for history
+  const historyContent = `## Synthesis\n\n${synthesisResult.reasoning || ""}\n\n## Key Insights\n\n${key_insights.map(i => `- ${i}`).join("\n")}\n\n## Assumptions Identified\n\n${assumptions_identified.map(a => `- ${a}`).join("\n")}\n\n## Potential Flaws\n\n${potential_flaws.map(f => `- ${f}`).join("\n")}\n\n## Conclusion\n\n${conclusion}\n\n**Confidence:** ${confidence}\n\n## Reasoning Threads\n\n${reasoning_threads.map(t => `### ${t.framework} (${t.agent})\n\n${t.reasoning}`).join("\n\n")}`;
+
+  try {
+    await saveToolResponse({
+      tool: "deep_think",
+      topic: problem.substring(0, 100),
+      content: historyContent,
+      query: problem,
+      tags: ["reasoning", depth, confidence],
+      duration_ms: total_duration_ms,
+      agents: resultObj.methodology.agents_consulted,
+      extras: { depth, frameworks: selectedFrameworks },
+    });
+  } catch (e) {
+    log.warn("Failed to save response to history", e);
+  }
+
+  return resultObj;
 }
 
 /**
