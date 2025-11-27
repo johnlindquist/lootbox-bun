@@ -9,6 +9,10 @@
  * - Comparing reasoning approaches across models
  * - Validating answers by consensus
  * - Exploring different solution strategies
+ * - Debate mode: agents critique each other's answers
+ * - Consensus detection: identify agreements vs disagreements
+ * - Devil's advocate: force critical analysis
+ * - Role-based queries: specialized personas per agent
  */
 
 import { createLogger, extractErrorMessage, type ProgressCallback } from "./shared/index.ts";
@@ -59,6 +63,42 @@ const AGENTS = {
 
 type AgentName = keyof typeof AGENTS;
 type ParseOutputType = typeof AGENTS[AgentName]["parseOutput"];
+
+// Predefined role configurations for specialized perspectives
+const ROLE_PRESETS = {
+  // Software development roles
+  software: {
+    claude: "You are a senior software architect. Focus on system design, scalability, maintainability, and best practices.",
+    codex: "You are a senior implementation engineer. Focus on code quality, performance optimization, and practical implementation details.",
+    gemini: "You are a QA engineer and security specialist. Focus on edge cases, potential bugs, security vulnerabilities, and testing strategies.",
+  },
+  // Security audit roles
+  security: {
+    claude: "You are a security architect. Analyze for architectural security flaws, threat modeling, and defense in depth.",
+    codex: "You are a penetration tester. Look for exploitable vulnerabilities, injection points, and attack vectors in the code.",
+    gemini: "You are a compliance auditor. Check for OWASP top 10, data protection issues, and security best practices.",
+  },
+  // Code review roles
+  review: {
+    claude: "You are Martin Fowler. Focus on refactoring opportunities, design patterns, and code clarity.",
+    codex: "You are a performance engineer. Look for inefficiencies, memory issues, and optimization opportunities.",
+    gemini: "You are a junior developer reviewing for readability. Point out confusing code, missing docs, and unclear naming.",
+  },
+  // Creative/brainstorming roles
+  creative: {
+    claude: "You are a creative writer. Focus on clarity, narrative flow, and engaging communication.",
+    codex: "You are an editor. Focus on structure, conciseness, and eliminating redundancy.",
+    gemini: "You are a fact-checker. Verify claims, check for logical consistency, and identify gaps.",
+  },
+  // Architecture decision roles
+  architecture: {
+    claude: "You are a distributed systems expert. Focus on scalability, fault tolerance, and system boundaries.",
+    codex: "You are a data modeling expert. Focus on data flow, storage patterns, and API design.",
+    gemini: "You are a DevOps engineer. Focus on deployment, monitoring, operational complexity, and cost.",
+  },
+} as const;
+
+type RolePreset = keyof typeof ROLE_PRESETS;
 
 /**
  * Parse streaming JSON output from Claude CLI (stream-json format)
@@ -202,7 +242,8 @@ interface CouncilResult {
 async function queryAgent(
   agentKey: AgentName,
   question: string,
-  timeout: number
+  timeout: number,
+  role?: string
 ): Promise<AgentResponse> {
   const agent = AGENTS[agentKey];
   const startTime = Date.now();
@@ -211,8 +252,25 @@ async function queryAgent(
   sendProgress(`[${agent.name}] Starting query...`);
 
   try {
-    // Build the command
-    const args = [...agent.args, question];
+    // Build the command with optional role
+    let args = [...agent.args];
+
+    // Add role/system prompt if provided
+    if (role) {
+      if (agentKey === "claude") {
+        // Claude uses --append-system-prompt for additional system context
+        args = args.filter(a => a !== "ultrathink"); // Remove default
+        args.push("--append-system-prompt", `${role}\n\nThink deeply and carefully.`);
+      } else if (agentKey === "codex") {
+        // Codex: prepend role to the question
+        question = `[System: ${role}]\n\n${question}`;
+      } else if (agentKey === "gemini") {
+        // Gemini: prepend role to the question
+        question = `[System: ${role}]\n\n${question}`;
+      }
+    }
+
+    args.push(question);
 
     log.debug(`Running: ${agent.command} ${args.join(" ")}`);
 
@@ -346,12 +404,16 @@ async function queryAgent(
  * @param args.agents - Optional list of agents to query (defaults to all: claude, codex, gemini)
  * @param args.timeout_seconds - Timeout per agent in seconds (default: 120)
  * @param args.include_summary - If true, includes a comparison summary at the end
+ * @param args.role_preset - Use a predefined role configuration (software, security, review, creative, architecture)
+ * @param args.roles - Custom roles per agent: { claude: "...", codex: "...", gemini: "..." }
  */
 export async function ask(args: {
   question: string;
   agents?: AgentName[];
   timeout_seconds?: number;
   include_summary?: boolean;
+  role_preset?: RolePreset;
+  roles?: Partial<Record<AgentName, string>>;
 }): Promise<CouncilResult> {
   log.call("ask", args);
   const {
@@ -359,7 +421,17 @@ export async function ask(args: {
     agents = ["claude", "codex", "gemini"],
     timeout_seconds = 120,
     include_summary = false,
+    role_preset,
+    roles,
   } = args;
+
+  // Resolve roles: custom roles override preset
+  const resolvedRoles: Partial<Record<AgentName, string>> = role_preset
+    ? { ...ROLE_PRESETS[role_preset] }
+    : {};
+  if (roles) {
+    Object.assign(resolvedRoles, roles);
+  }
 
   if (!question || question.trim().length === 0) {
     const err = "Question is required";
@@ -383,7 +455,8 @@ export async function ask(args: {
         duration_ms: 0,
       });
     }
-    return queryAgent(agentKey, question, timeout);
+    const role = resolvedRoles[agentKey];
+    return queryAgent(agentKey, question, timeout, role);
   });
 
   const responses = await Promise.all(responsePromises);
@@ -552,4 +625,438 @@ export async function query_single(args: {
 
   const response = await queryAgent(agent, question, timeout_seconds * 1000);
   return response;
+}
+
+// =============================================================================
+// NEW COUNCIL FEATURES
+// =============================================================================
+
+interface ConsensusResult {
+  success: boolean;
+  question: string;
+  consensus: string[]; // Points all agents agree on
+  disputed: string[]; // Points where agents disagree
+  unique_insights: Record<string, string[]>; // Unique points per agent
+  confidence: "high" | "medium" | "low"; // Based on agreement level
+  total_duration_ms: number;
+  error?: string;
+}
+
+interface DebateResult {
+  success: boolean;
+  question: string;
+  rounds: Array<{
+    round: number;
+    type: "initial" | "critique" | "rebuttal";
+    responses: AgentResponse[];
+  }>;
+  final_synthesis?: string;
+  total_duration_ms: number;
+  error?: string;
+}
+
+/**
+ * Debate mode - agents critique each other's answers in multiple rounds
+ *
+ * Round 1: Initial answers from all agents
+ * Round 2: Each agent critiques the other agents' answers
+ * Round 3: Final synthesis with refined positions
+ *
+ * @param args.question - The question to debate
+ * @param args.agents - Which agents to include (default: all)
+ * @param args.rounds - Number of debate rounds (default: 2, max: 3)
+ * @param args.timeout_seconds - Timeout per query (default: 120)
+ */
+export async function debate(args: {
+  question: string;
+  agents?: AgentName[];
+  rounds?: number;
+  timeout_seconds?: number;
+}): Promise<DebateResult> {
+  log.call("debate", args);
+  const {
+    question,
+    agents = ["claude", "codex", "gemini"],
+    rounds = 2,
+    timeout_seconds = 120,
+  } = args;
+
+  if (!question || question.trim().length === 0) {
+    return { success: false, question: "", rounds: [], total_duration_ms: 0, error: "Question is required" };
+  }
+
+  const startTime = Date.now();
+  const timeout = timeout_seconds * 1000;
+  const debateRounds: DebateResult["rounds"] = [];
+
+  sendProgress(`Starting debate with ${agents.length} agents, ${rounds} rounds...`);
+
+  // Round 1: Initial answers
+  sendProgress("[Round 1] Getting initial positions...");
+  const initialResponses = await Promise.all(
+    agents.map((a) => queryAgent(a, question, timeout))
+  );
+  debateRounds.push({ round: 1, type: "initial", responses: initialResponses });
+
+  if (rounds < 2) {
+    return {
+      success: true,
+      question,
+      rounds: debateRounds,
+      total_duration_ms: Date.now() - startTime,
+    };
+  }
+
+  // Round 2: Critique phase
+  sendProgress("[Round 2] Agents critiquing each other's answers...");
+  const successfulInitial = initialResponses.filter((r) => r.success);
+
+  if (successfulInitial.length < 2) {
+    return {
+      success: true,
+      question,
+      rounds: debateRounds,
+      total_duration_ms: Date.now() - startTime,
+      error: "Not enough successful responses for critique round",
+    };
+  }
+
+  // Format other agents' responses for critique
+  const formatOtherResponses = (currentAgent: string) => {
+    return successfulInitial
+      .filter((r) => r.agent !== currentAgent)
+      .map((r) => `### ${r.agent}'s answer:\n${r.response}`)
+      .join("\n\n");
+  };
+
+  const critiquePromises = agents.map((agentKey) => {
+    const otherResponses = formatOtherResponses(AGENTS[agentKey].name);
+    const critiquePrompt = `Original question: ${question}
+
+Here are the other council members' answers:
+
+${otherResponses}
+
+Please provide a thoughtful critique of these answers:
+1. What do you agree with?
+2. What do you disagree with and why?
+3. What important points did they miss?
+4. What's your refined position considering their perspectives?`;
+
+    return queryAgent(agentKey, critiquePrompt, timeout);
+  });
+
+  const critiqueResponses = await Promise.all(critiquePromises);
+  debateRounds.push({ round: 2, type: "critique", responses: critiqueResponses });
+
+  // Round 3 (optional): Final synthesis/rebuttal
+  if (rounds >= 3) {
+    sendProgress("[Round 3] Final synthesis...");
+
+    const synthesisPrompt = `After this debate on "${question}", provide your final, refined answer that:
+1. Incorporates the strongest points from all perspectives
+2. Addresses the main disagreements
+3. Presents a clear, well-reasoned conclusion
+
+Previous critiques:
+${critiqueResponses.filter((r) => r.success).map((r) => `${r.agent}: ${r.response?.substring(0, 500)}...`).join("\n\n")}`;
+
+    const synthesisResponses = await Promise.all(
+      agents.map((a) => queryAgent(a, synthesisPrompt, timeout))
+    );
+    debateRounds.push({ round: 3, type: "rebuttal", responses: synthesisResponses });
+  }
+
+  // Generate final synthesis by identifying common ground
+  const allSuccessful = debateRounds.flatMap((r) => r.responses).filter((r) => r.success);
+  const final_synthesis = allSuccessful.length > 0
+    ? `Debate completed with ${debateRounds.length} rounds. ${allSuccessful.length} successful responses gathered.`
+    : undefined;
+
+  log.success("debate", { rounds: debateRounds.length });
+
+  return {
+    success: true,
+    question,
+    rounds: debateRounds,
+    final_synthesis,
+    total_duration_ms: Date.now() - startTime,
+  };
+}
+
+/**
+ * Consensus detection - analyze responses to identify agreements and disagreements
+ *
+ * @param args.question - The question to analyze
+ * @param args.agents - Which agents to query (default: all)
+ * @param args.timeout_seconds - Timeout per query (default: 120)
+ */
+export async function consensus(args: {
+  question: string;
+  agents?: AgentName[];
+  timeout_seconds?: number;
+}): Promise<ConsensusResult> {
+  log.call("consensus", args);
+  const {
+    question,
+    agents = ["claude", "codex", "gemini"],
+    timeout_seconds = 120,
+  } = args;
+
+  if (!question || question.trim().length === 0) {
+    return {
+      success: false,
+      question: "",
+      consensus: [],
+      disputed: [],
+      unique_insights: {},
+      confidence: "low",
+      total_duration_ms: 0,
+      error: "Question is required",
+    };
+  }
+
+  const startTime = Date.now();
+
+  // First, get all responses
+  sendProgress("Gathering responses for consensus analysis...");
+  const result = await ask({ question, agents, timeout_seconds, include_summary: false });
+
+  if (!result.success) {
+    return {
+      success: false,
+      question,
+      consensus: [],
+      disputed: [],
+      unique_insights: {},
+      confidence: "low",
+      total_duration_ms: Date.now() - startTime,
+      error: result.error,
+    };
+  }
+
+  const successfulResponses = result.responses.filter((r) => r.success);
+  if (successfulResponses.length < 2) {
+    return {
+      success: false,
+      question,
+      consensus: [],
+      disputed: [],
+      unique_insights: {},
+      confidence: "low",
+      total_duration_ms: Date.now() - startTime,
+      error: "Need at least 2 successful responses for consensus analysis",
+    };
+  }
+
+  // Use one of the agents to analyze consensus
+  sendProgress("Analyzing responses for consensus...");
+
+  const analysisPrompt = `Analyze these ${successfulResponses.length} AI responses to the question: "${question}"
+
+${successfulResponses.map((r) => `### ${r.agent}:\n${r.response}`).join("\n\n---\n\n")}
+
+Provide a structured analysis in EXACTLY this format (use these exact headers):
+
+## CONSENSUS (points all agents agree on)
+- [List each agreed point as a bullet]
+
+## DISPUTED (points where agents disagree)
+- [List each disagreement as a bullet, noting which agents disagree]
+
+## UNIQUE INSIGHTS
+### ${successfulResponses[0].agent}
+- [Unique points from this agent]
+### ${successfulResponses[1].agent}
+- [Unique points from this agent]
+${successfulResponses[2] ? `### ${successfulResponses[2].agent}\n- [Unique points from this agent]` : ""}
+
+## CONFIDENCE
+[State: HIGH if strong agreement, MEDIUM if partial agreement, LOW if mostly disagreement]`;
+
+  const analysisResponse = await queryAgent("claude", analysisPrompt, timeout_seconds * 1000);
+
+  if (!analysisResponse.success || !analysisResponse.response) {
+    return {
+      success: true,
+      question,
+      consensus: ["Analysis failed - raw responses available in individual agent responses"],
+      disputed: [],
+      unique_insights: Object.fromEntries(
+        successfulResponses.map((r) => [r.agent, [r.response?.substring(0, 200) || ""]])
+      ),
+      confidence: "low",
+      total_duration_ms: Date.now() - startTime,
+    };
+  }
+
+  // Parse the structured analysis
+  const analysisText = analysisResponse.response;
+
+  // Extract sections using regex
+  const consensusMatch = analysisText.match(/## CONSENSUS[^\n]*\n([\s\S]*?)(?=## DISPUTED|$)/i);
+  const disputedMatch = analysisText.match(/## DISPUTED[^\n]*\n([\s\S]*?)(?=## UNIQUE|$)/i);
+  const uniqueMatch = analysisText.match(/## UNIQUE INSIGHTS\n([\s\S]*?)(?=## CONFIDENCE|$)/i);
+  const confidenceMatch = analysisText.match(/## CONFIDENCE\n([\s\S]*?)$/i);
+
+  // Parse bullet points
+  const parseBullets = (text: string | undefined): string[] => {
+    if (!text) return [];
+    return text
+      .split("\n")
+      .filter((line) => line.trim().startsWith("-") || line.trim().startsWith("*"))
+      .map((line) => line.replace(/^[\s]*[-*]\s*/, "").trim())
+      .filter((line) => line.length > 0);
+  };
+
+  // Parse unique insights per agent
+  const parseUniqueInsights = (text: string | undefined): Record<string, string[]> => {
+    if (!text) return {};
+    const insights: Record<string, string[]> = {};
+    const agentSections = text.split(/### /);
+
+    for (const section of agentSections) {
+      if (!section.trim()) continue;
+      const lines = section.split("\n");
+      const agentName = lines[0]?.trim();
+      if (agentName) {
+        insights[agentName] = parseBullets(lines.slice(1).join("\n"));
+      }
+    }
+    return insights;
+  };
+
+  // Determine confidence level
+  const confidenceText = confidenceMatch?.[1]?.toLowerCase() || "";
+  let confidence: "high" | "medium" | "low" = "medium";
+  if (confidenceText.includes("high")) confidence = "high";
+  else if (confidenceText.includes("low")) confidence = "low";
+
+  log.success("consensus", { confidence });
+
+  return {
+    success: true,
+    question,
+    consensus: parseBullets(consensusMatch?.[1]),
+    disputed: parseBullets(disputedMatch?.[1]),
+    unique_insights: parseUniqueInsights(uniqueMatch?.[1]),
+    confidence,
+    total_duration_ms: Date.now() - startTime,
+  };
+}
+
+/**
+ * Devil's Advocate mode - one agent plays contrarian to stress-test ideas
+ *
+ * @param args.question - The idea/proposal to stress-test
+ * @param args.contrarian - Which agent should be the devil's advocate (default: random)
+ * @param args.agents - Which agents to include (default: all)
+ * @param args.timeout_seconds - Timeout per query (default: 120)
+ */
+export async function devils_advocate(args: {
+  question: string;
+  contrarian?: AgentName;
+  agents?: AgentName[];
+  timeout_seconds?: number;
+}): Promise<{
+  success: boolean;
+  question: string;
+  supportive_responses: AgentResponse[];
+  contrarian_response: AgentResponse;
+  contrarian_agent: string;
+  total_duration_ms: number;
+  error?: string;
+}> {
+  log.call("devils_advocate", args);
+  const {
+    question,
+    agents = ["claude", "codex", "gemini"],
+    timeout_seconds = 120,
+  } = args;
+
+  if (!question || question.trim().length === 0) {
+    return {
+      success: false,
+      question: "",
+      supportive_responses: [],
+      contrarian_response: { agent: "", model: "", success: false, duration_ms: 0 },
+      contrarian_agent: "",
+      total_duration_ms: 0,
+      error: "Question is required",
+    };
+  }
+
+  const startTime = Date.now();
+  const timeout = timeout_seconds * 1000;
+
+  // Select contrarian agent (random if not specified)
+  const contrarian = args.contrarian || agents[Math.floor(Math.random() * agents.length)];
+  const supportiveAgents = agents.filter((a) => a !== contrarian);
+
+  sendProgress(`Devil's advocate mode: ${AGENTS[contrarian].name} will argue against...`);
+
+  // Contrarian role prompt
+  const contrarianRole = `You are the Devil's Advocate. Your job is to find flaws, edge cases, risks, and counterarguments to the proposal. Be critical, thorough, and skeptical. Challenge assumptions, identify potential failures, and argue the opposing position convincingly. Do NOT be supportive - your goal is to stress-test this idea.`;
+
+  // Supportive role prompt
+  const supportiveRole = `Analyze this proposal constructively. Identify strengths, potential benefits, and how it could succeed. Be supportive but realistic.`;
+
+  // Query all agents in parallel
+  const queries = [
+    // Contrarian query
+    queryAgent(contrarian, question, timeout, contrarianRole),
+    // Supportive queries
+    ...supportiveAgents.map((a) => queryAgent(a, question, timeout, supportiveRole)),
+  ];
+
+  const [contrarianResponse, ...supportiveResponses] = await Promise.all(queries);
+
+  log.success("devils_advocate", { contrarian });
+
+  return {
+    success: true,
+    question,
+    supportive_responses: supportiveResponses,
+    contrarian_response: contrarianResponse,
+    contrarian_agent: AGENTS[contrarian].name,
+    total_duration_ms: Date.now() - startTime,
+  };
+}
+
+/**
+ * List available role presets for specialized queries
+ */
+export async function list_role_presets(): Promise<{
+  success: boolean;
+  presets: Array<{
+    name: string;
+    description: string;
+    roles: Record<string, string>;
+  }>;
+}> {
+  log.call("list_role_presets", {});
+
+  const presets = Object.entries(ROLE_PRESETS).map(([name, roles]) => ({
+    name,
+    description: getPresetDescription(name as RolePreset),
+    roles: roles as Record<string, string>,
+  }));
+
+  log.success("list_role_presets", presets);
+  return { success: true, presets };
+}
+
+function getPresetDescription(preset: RolePreset): string {
+  switch (preset) {
+    case "software":
+      return "Software development: architect, implementer, QA/security";
+    case "security":
+      return "Security audit: architect, pentester, compliance auditor";
+    case "review":
+      return "Code review: Fowler-style refactoring, performance, readability";
+    case "creative":
+      return "Creative: writer, editor, fact-checker";
+    case "architecture":
+      return "Architecture: distributed systems, data modeling, DevOps";
+  }
 }
