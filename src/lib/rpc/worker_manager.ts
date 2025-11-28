@@ -242,6 +242,8 @@ interface WorkerState {
   lastRestart: number;
   everReady: boolean; // Track if worker ever successfully started
   lastPong: number; // Last time we received a pong (for health checks)
+  highCpuCount: number; // Consecutive high CPU readings for escalating response
+  lastCpuPercent: number; // Last measured CPU percentage
 }
 
 interface ReadyMessage {
@@ -319,6 +321,7 @@ export class WorkerManager {
   private progressCallback?: ProgressCallback;
   private healthCheckInterval?: ReturnType<typeof setInterval>;
   private staleCallCleanupInterval?: ReturnType<typeof setInterval>;
+  private cpuMonitorInterval?: ReturnType<typeof setInterval>;
   private pendingPings = new Map<string, { workerId: string; timeoutId: ReturnType<typeof setTimeout> }>();
 
   // Session memory - cleared on server restart
@@ -330,10 +333,29 @@ export class WorkerManager {
   private static readonly STALE_CALL_THRESHOLD_MS = 300000; // 5 minutes
   private static readonly STALE_CALL_CLEANUP_INTERVAL_MS = 60000; // Check every minute
 
+  // CPU monitoring configuration
+  private static readonly CPU_MONITOR_INTERVAL_MS = 5000; // Check CPU every 5 seconds
+  private static readonly CPU_THRESHOLD_PERCENT = 90; // Alert if CPU > 90%
+  private static readonly CPU_WARN_COUNT = 3; // Warn after 3 consecutive high readings (15s)
+  private static readonly CPU_GRACEFUL_COUNT = 6; // Graceful restart after 6 readings (30s)
+  private static readonly CPU_FORCE_KILL_COUNT = 12; // Force kill after 12 readings (60s)
+
+  // Tools exempt from CPU monitoring (known to be CPU-intensive)
+  private static readonly CPU_EXEMPT_TOOLS = new Set([
+    "gemini",           // AI inference can spike CPU
+    "deep_review",      // Multi-agent processing
+    "deep_think",       // Extended reasoning
+    "deep_research",    // Parallel research queries
+    "code_spider",      // Parallel code analysis
+    "council",          // Multi-agent queries
+    "brainstorm",       // Creative processing
+  ]);
+
   constructor(port: number) {
     this.port = port;
     this.startHealthChecks();
     this.startStaleCallCleanup();
+    this.startCpuMonitoring();
   }
 
   // ============== Session Memory Management ==============
@@ -428,6 +450,180 @@ export class WorkerManager {
         console.error(`[WorkerManager] Cleaned up ${cleanedCount} stale pending calls`);
       }
     }, WorkerManager.STALE_CALL_CLEANUP_INTERVAL_MS);
+  }
+
+  /**
+   * Start periodic CPU monitoring for workers
+   * Uses `ps` command to batch query CPU usage for all worker PIDs
+   * Implements escalating response: warn → graceful restart → force kill
+   */
+  private startCpuMonitoring(): void {
+    this.cpuMonitorInterval = setInterval(async () => {
+      await this.checkWorkerCpuUsage();
+    }, WorkerManager.CPU_MONITOR_INTERVAL_MS);
+  }
+
+  /**
+   * Check CPU usage for all worker processes
+   * Uses batch `ps` query for efficiency
+   */
+  private async checkWorkerCpuUsage(): Promise<void> {
+    // Get all worker PIDs
+    const workerPids: Map<number, WorkerState> = new Map();
+    for (const worker of this.workers.values()) {
+      if (worker.status === "ready" && worker.process.pid) {
+        workerPids.set(worker.process.pid, worker);
+      }
+    }
+
+    if (workerPids.size === 0) return;
+
+    // Batch query CPU usage using ps command
+    const pids = Array.from(workerPids.keys()).join(",");
+    try {
+      const proc = Bun.spawn(["ps", "-o", "pid,%cpu", "-p", pids], {
+        stdout: "pipe",
+        stderr: "ignore",
+      });
+
+      const output = await new Response(proc.stdout).text();
+      await proc.exited;
+
+      // Parse ps output (skip header line)
+      const lines = output.trim().split("\n").slice(1);
+      for (const line of lines) {
+        const parts = line.trim().split(/\s+/);
+        if (parts.length >= 2) {
+          const pid = parseInt(parts[0], 10);
+          const cpu = parseFloat(parts[1]);
+
+          const worker = workerPids.get(pid);
+          if (worker) {
+            worker.lastCpuPercent = cpu;
+            this.handleWorkerCpu(worker, cpu);
+          }
+        }
+      }
+
+      // Reset CPU count for workers not in the output (process may have died)
+      for (const worker of workerPids.values()) {
+        if (worker.lastCpuPercent === undefined) {
+          worker.highCpuCount = 0;
+        }
+      }
+    } catch (error) {
+      // ps command failed - log but don't crash
+      log.warn({ error: String(error) }, "CPU monitoring ps command failed");
+    }
+  }
+
+  /**
+   * Handle CPU reading for a single worker
+   * Implements escalating response based on consecutive high readings
+   */
+  private handleWorkerCpu(worker: WorkerState, cpuPercent: number): void {
+    // Check if this tool is exempt from CPU monitoring
+    if (WorkerManager.CPU_EXEMPT_TOOLS.has(worker.workerId)) {
+      // Still track but don't take action - just log if extremely high
+      if (cpuPercent > 95 && worker.highCpuCount === 0) {
+        log.debug({ worker: worker.workerId, cpu: cpuPercent }, "Exempt tool high CPU (expected)");
+      }
+      return;
+    }
+
+    // Check if CPU is above threshold
+    if (cpuPercent > WorkerManager.CPU_THRESHOLD_PERCENT) {
+      worker.highCpuCount++;
+
+      // Escalating response
+      if (worker.highCpuCount >= WorkerManager.CPU_FORCE_KILL_COUNT) {
+        // Force kill after 60 seconds of high CPU
+        console.error(
+          `[WorkerManager] 🔥 FORCE KILLING worker ${worker.workerId} - CPU at ${cpuPercent.toFixed(1)}% for ${worker.highCpuCount * 5}s`
+        );
+        this.forceKillWorker(worker.workerId);
+      } else if (worker.highCpuCount >= WorkerManager.CPU_GRACEFUL_COUNT) {
+        // Graceful restart after 30 seconds of high CPU
+        console.error(
+          `[WorkerManager] ⚠️  RESTARTING worker ${worker.workerId} - CPU at ${cpuPercent.toFixed(1)}% for ${worker.highCpuCount * 5}s`
+        );
+        this.gracefulRestartWorker(worker.workerId);
+      } else if (worker.highCpuCount >= WorkerManager.CPU_WARN_COUNT) {
+        // Warn after 15 seconds of high CPU
+        console.error(
+          `[WorkerManager] ⚠️  Worker ${worker.workerId} high CPU: ${cpuPercent.toFixed(1)}% for ${worker.highCpuCount * 5}s`
+        );
+      }
+    } else {
+      // CPU is normal - reset counter
+      if (worker.highCpuCount > 0) {
+        log.debug({ worker: worker.workerId, cpu: cpuPercent }, "Worker CPU returned to normal");
+      }
+      worker.highCpuCount = 0;
+    }
+  }
+
+  /**
+   * Gracefully restart a worker (allows pending calls to complete)
+   */
+  private async gracefulRestartWorker(workerId: string): Promise<void> {
+    const worker = this.workers.get(workerId);
+    if (!worker) return;
+
+    // Don't restart if already restarting
+    if (worker.status !== "ready") return;
+
+    // Mark as crashed to prevent new calls
+    worker.status = "crashed";
+
+    // Give pending calls a short grace period
+    const gracePeriodMs = 5000;
+    const startTime = Date.now();
+    while (worker.pendingCalls.size > 0 && Date.now() - startTime < gracePeriodMs) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+
+    // Now restart
+    const file: RpcFile = { name: workerId, path: worker.filePath };
+    await this.restartWorker(workerId, file);
+    workerRestarts.inc({ worker: workerId, reason: "high_cpu" });
+    log.warn({ worker: workerId }, "Worker restarted due to high CPU");
+  }
+
+  /**
+   * Force kill a worker immediately (for unresponsive runaway processes)
+   */
+  private async forceKillWorker(workerId: string): Promise<void> {
+    const worker = this.workers.get(workerId);
+    if (!worker) return;
+
+    // Reject all pending calls immediately
+    for (const [, pending] of worker.pendingCalls) {
+      clearTimeout(pending.timeoutId);
+      pending.reject(new Error(`Worker ${workerId} force killed due to runaway CPU`));
+    }
+    worker.pendingCalls.clear();
+
+    // SIGKILL - no mercy
+    try {
+      worker.process.kill(9);
+    } catch {
+      // Already dead
+    }
+
+    // Clean up temp file
+    try {
+      await unlink(worker.tempFilePath);
+    } catch {
+      // Ignore
+    }
+
+    // Restart fresh
+    worker.highCpuCount = 0;
+    const file: RpcFile = { name: workerId, path: worker.filePath };
+    await this.startWorker(file);
+    workerRestarts.inc({ worker: workerId, reason: "force_kill_cpu" });
+    log.error({ worker: workerId }, "Worker force killed and restarted due to runaway CPU");
   }
 
   /**
@@ -535,6 +731,8 @@ export class WorkerManager {
       lastRestart: Date.now(),
       everReady: false,
       lastPong: Date.now(), // Initialize to now
+      highCpuCount: 0, // Initialize CPU tracking
+      lastCpuPercent: 0,
     };
 
     this.workers.set(workerId, worker);
@@ -795,6 +993,10 @@ export class WorkerManager {
     if (this.staleCallCleanupInterval) {
       clearInterval(this.staleCallCleanupInterval);
       this.staleCallCleanupInterval = undefined;
+    }
+    if (this.cpuMonitorInterval) {
+      clearInterval(this.cpuMonitorInterval);
+      this.cpuMonitorInterval = undefined;
     }
 
     // Clear pending pings
