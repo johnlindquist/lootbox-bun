@@ -340,12 +340,18 @@ export class WorkerManager {
   private static readonly CPU_GRACEFUL_COUNT = 6; // Graceful restart after 6 readings (30s)
   private static readonly CPU_FORCE_KILL_COUNT = 12; // Force kill after 12 readings (60s)
 
-  // Tools exempt from CPU monitoring (known to be CPU-intensive)
-  private static readonly CPU_EXEMPT_TOOLS = new Set([
+  // Extended thresholds for CPU-intensive tools (still monitored, but more tolerant)
+  private static readonly CPU_EXEMPT_WARN_COUNT = 12; // Warn after 60s for exempt tools
+  private static readonly CPU_EXEMPT_FORCE_KILL_COUNT = 60; // Force kill after 5 minutes (extreme)
+
+  // Tools with extended CPU tolerance (known to be CPU-intensive)
+  // These are still monitored but with longer thresholds and no graceful restart
+  private static readonly CPU_INTENSIVE_TOOLS = new Set([
     "gemini",           // AI inference can spike CPU
     "deep_review",      // Multi-agent processing
     "deep_think",       // Extended reasoning
     "deep_research",    // Parallel research queries
+    "deep_research_enhanced",
     "code_spider",      // Parallel code analysis
     "council",          // Multi-agent queries
     "brainstorm",       // Creative processing
@@ -520,44 +526,57 @@ export class WorkerManager {
   /**
    * Handle CPU reading for a single worker
    * Implements escalating response based on consecutive high readings
+   * CPU-intensive tools have extended thresholds but are still monitored
    */
   private handleWorkerCpu(worker: WorkerState, cpuPercent: number): void {
-    // Check if this tool is exempt from CPU monitoring
-    if (WorkerManager.CPU_EXEMPT_TOOLS.has(worker.workerId)) {
-      // Still track but don't take action - just log if extremely high
-      if (cpuPercent > 95 && worker.highCpuCount === 0) {
-        log.debug({ worker: worker.workerId, cpu: cpuPercent }, "Exempt tool high CPU (expected)");
-      }
-      return;
-    }
+    const isIntensive = WorkerManager.CPU_INTENSIVE_TOOLS.has(worker.workerId);
 
     // Check if CPU is above threshold
     if (cpuPercent > WorkerManager.CPU_THRESHOLD_PERCENT) {
       worker.highCpuCount++;
+      const durationSec = worker.highCpuCount * 5;
 
-      // Escalating response
-      if (worker.highCpuCount >= WorkerManager.CPU_FORCE_KILL_COUNT) {
-        // Force kill after 60 seconds of high CPU
-        console.error(
-          `[WorkerManager] 🔥 FORCE KILLING worker ${worker.workerId} - CPU at ${cpuPercent.toFixed(1)}% for ${worker.highCpuCount * 5}s`
-        );
-        this.forceKillWorker(worker.workerId);
-      } else if (worker.highCpuCount >= WorkerManager.CPU_GRACEFUL_COUNT) {
-        // Graceful restart after 30 seconds of high CPU
-        console.error(
-          `[WorkerManager] ⚠️  RESTARTING worker ${worker.workerId} - CPU at ${cpuPercent.toFixed(1)}% for ${worker.highCpuCount * 5}s`
-        );
-        this.gracefulRestartWorker(worker.workerId);
-      } else if (worker.highCpuCount >= WorkerManager.CPU_WARN_COUNT) {
-        // Warn after 15 seconds of high CPU
-        console.error(
-          `[WorkerManager] ⚠️  Worker ${worker.workerId} high CPU: ${cpuPercent.toFixed(1)}% for ${worker.highCpuCount * 5}s`
-        );
+      if (isIntensive) {
+        // CPU-intensive tools: extended thresholds, no graceful restart
+        if (worker.highCpuCount >= WorkerManager.CPU_EXEMPT_FORCE_KILL_COUNT) {
+          // Force kill after 5 minutes - something is seriously wrong
+          console.error(
+            `[WorkerManager] 🔥 FORCE KILLING CPU-intensive worker ${worker.workerId} - CPU at ${cpuPercent.toFixed(1)}% for ${durationSec}s (exceeded 5min limit)`
+          );
+          this.forceKillWorker(worker.workerId);
+        } else if (worker.highCpuCount >= WorkerManager.CPU_EXEMPT_WARN_COUNT) {
+          // Warn after 60 seconds (log only once per minute to reduce spam)
+          if (worker.highCpuCount % 12 === 0) {
+            console.error(
+              `[WorkerManager] ⚠️  CPU-intensive worker ${worker.workerId} high CPU: ${cpuPercent.toFixed(1)}% for ${durationSec}s (will force kill at 5min)`
+            );
+          }
+        }
+      } else {
+        // Regular tools: standard thresholds
+        if (worker.highCpuCount >= WorkerManager.CPU_FORCE_KILL_COUNT) {
+          // Force kill after 60 seconds of high CPU
+          console.error(
+            `[WorkerManager] 🔥 FORCE KILLING worker ${worker.workerId} - CPU at ${cpuPercent.toFixed(1)}% for ${durationSec}s`
+          );
+          this.forceKillWorker(worker.workerId);
+        } else if (worker.highCpuCount >= WorkerManager.CPU_GRACEFUL_COUNT) {
+          // Graceful restart after 30 seconds of high CPU
+          console.error(
+            `[WorkerManager] ⚠️  RESTARTING worker ${worker.workerId} - CPU at ${cpuPercent.toFixed(1)}% for ${durationSec}s`
+          );
+          this.gracefulRestartWorker(worker.workerId);
+        } else if (worker.highCpuCount >= WorkerManager.CPU_WARN_COUNT) {
+          // Warn after 15 seconds of high CPU
+          console.error(
+            `[WorkerManager] ⚠️  Worker ${worker.workerId} high CPU: ${cpuPercent.toFixed(1)}% for ${durationSec}s`
+          );
+        }
       }
     } else {
       // CPU is normal - reset counter
       if (worker.highCpuCount > 0) {
-        log.debug({ worker: worker.workerId, cpu: cpuPercent }, "Worker CPU returned to normal");
+        log.debug({ worker: worker.workerId, cpu: cpuPercent, wasIntensive: isIntensive }, "Worker CPU returned to normal");
       }
       worker.highCpuCount = 0;
     }
