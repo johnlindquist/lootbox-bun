@@ -33,6 +33,7 @@ const CHECK_INTERVAL_MS = 5000; // Check every 5 seconds
 export class HealthMonitor {
   private intervalId: ReturnType<typeof setInterval> | null = null;
   private lagCheckTimeoutId: ReturnType<typeof setTimeout> | null = null; // Track for cleanup
+  private lagCheckImmediateId: ReturnType<typeof setImmediate> | null = null; // Track setImmediate for cleanup
   private lastCpuUsage: NodeJS.CpuUsage | null = null;
   private lastCheck: number = Date.now();
   private consecutiveHighCpu = 0;
@@ -81,6 +82,12 @@ export class HealthMonitor {
       this.lagCheckTimeoutId = null;
     }
 
+    // Clear the setImmediate handle to prevent orphaned callbacks
+    if (this.lagCheckImmediateId) {
+      clearImmediate(this.lagCheckImmediateId);
+      this.lagCheckImmediateId = null;
+    }
+
     console.error("[HealthMonitor] Stopped health monitoring");
   }
 
@@ -91,11 +98,17 @@ export class HealthMonitor {
     if (!this.enabled) return;
 
     this.lagCheckStart = performance.now();
-    setImmediate(() => {
+    // Track the setImmediate handle for proper cleanup
+    this.lagCheckImmediateId = setImmediate(() => {
       if (!this.enabled) return; // Check again after setImmediate
 
       const lag = performance.now() - this.lagCheckStart;
       this.lastEventLoopLag = lag;
+
+      // Check enabled again before scheduling next iteration
+      // This prevents a race where stop() is called after setImmediate fires
+      // but before setTimeout is scheduled
+      if (!this.enabled) return;
 
       // Reschedule - track timeout ID for cleanup
       this.lagCheckTimeoutId = setTimeout(() => this.scheduleEventLoopCheck(), 1000);

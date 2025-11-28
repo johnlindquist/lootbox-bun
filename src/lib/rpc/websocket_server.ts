@@ -239,8 +239,7 @@ export class WebSocketRpcServer {
             ws,
             message,
             messageRouter,
-            () => rpcCacheManager.getFunctionNames(),
-            workerManager
+            () => rpcCacheManager.getFunctionNames()
           );
         },
         close(ws) {

@@ -15,7 +15,7 @@
  */
 
 import type { MessageRouter } from "./message_router.ts";
-import type { WorkerManager } from "../worker_manager.ts";
+// Note: WorkerManager import removed - workers now use IPC (see commit a475ec8)
 import type { ServerWebSocket } from "bun";
 
 // Type for Hono WebSocket context
@@ -48,7 +48,7 @@ interface ClientInfo {
 export class ConnectionManager {
   private clients = new Set<WebSocketContext>();
   private bunClients = new Map<ServerWebSocket<unknown>, ClientInfo>();
-  private bunWorkers = new Map<string, ServerWebSocket<unknown>>();
+  // Note: Workers now use IPC instead of WebSocket (see commit a475ec8)
   private cleanupInterval: ReturnType<typeof setInterval> | null = null;
 
   constructor() {
@@ -226,13 +226,13 @@ export class ConnectionManager {
 
   /**
    * Handle Bun WebSocket message event
+   * Note: workerManager parameter removed - workers now use IPC (see commit a475ec8)
    */
   async handleWebSocketMessage(
     ws: ServerWebSocket<unknown>,
     message: string | Buffer,
     messageRouter: MessageRouter,
-    availableFunctions: () => string[],
-    workerManager: WorkerManager
+    availableFunctions: () => string[]
   ): Promise<void> {
     const data = typeof message === "string" ? message : message.toString();
 
@@ -257,34 +257,8 @@ export class ConnectionManager {
     try {
       const parsed = JSON.parse(data);
 
-      // Check if this is a worker identifying itself
-      if (parsed.type === "identify" && parsed.workerId) {
-        const workerId = parsed.workerId as string;
-        // Move from clients to workers (use ws directly since Map key is the ws)
-        this.bunClients.delete(ws);
-        this.bunWorkers.set(workerId, ws);
-        // Register the send callback for this worker
-        workerManager.registerWorkerSender(workerId, (msg: string) => {
-          ws.send(msg);
-        });
-        // Forward to worker manager
-        workerManager.handleMessage(data);
-        return;
-      }
-
-      // Check if this is a worker message
-      if (this.bunWorkers.has(parsed.workerId)) {
-        workerManager.handleMessage(data);
-        return;
-      }
-
-      // If it's from a worker (ready, result, error, crash, progress messages)
-      if (parsed.type === "ready" || parsed.type === "result" || parsed.type === "error" || parsed.type === "crash" || parsed.type === "progress") {
-        workerManager.handleMessage(data);
-        return;
-      }
-
-      // Otherwise treat as client message
+      // Note: Worker communication now uses IPC instead of WebSocket (see commit a475ec8)
+      // All messages here are from clients
       if (this.bunClients.has(ws)) {
         // Send welcome if this is the first message (client just connected)
         if (!parsed.method && !parsed.script) {
@@ -309,64 +283,11 @@ export class ConnectionManager {
    */
   handleWebSocketClose(ws: ServerWebSocket<unknown>): void {
     // Remove from clients
+    // Note: Workers now use IPC, not WebSocket (see commit a475ec8)
     this.bunClients.delete(ws);
-
-    // Check if it was a worker
-    for (const [workerId, workerWs] of this.bunWorkers.entries()) {
-      if (workerWs === ws) {
-        this.bunWorkers.delete(workerId);
-        break;
-      }
-    }
   }
 
-  /**
-   * Create WebSocket handler for worker connections
-   */
-  createWorkerWebSocketHandler(workerManager: WorkerManager): WebSocketHandler {
-    let workerId: string | null = null;
-
-    return {
-      onOpen: (_event, _ws) => {
-        // We'll set the workerId when we get the identify message
-      },
-
-      onMessage: async (event, ws) => {
-        const data =
-          typeof event.data === "string"
-            ? event.data
-            : new TextDecoder().decode(
-                new Uint8Array(event.data as ArrayBuffer)
-              );
-
-        // Parse to get workerId from identify message
-        try {
-          const msg = JSON.parse(data);
-          if (msg.type === "identify" && msg.workerId) {
-            const id = msg.workerId as string;
-            workerId = id;
-            // Register the send callback for this worker
-            workerManager.registerWorkerSender(id, (message: string) => {
-              ws.send(message);
-            });
-          }
-        } catch {
-          // Ignore parse errors
-        }
-
-        // Forward all messages to worker manager
-        workerManager.handleMessage(data);
-      },
-
-      onClose: () => {
-        if (workerId) {
-          workerManager.handleDisconnect(workerId);
-        }
-      },
-
-      onError: (evt) => console.error("Worker WebSocket error:", evt),
-    };
-  }
+  // Note: createWorkerWebSocketHandler removed - workers now use IPC (see commit a475ec8)
 
   /**
    * Create WebSocket handler for client connections

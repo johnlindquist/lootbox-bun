@@ -236,114 +236,247 @@ async function fetchFunctions(): Promise<RpcFunction[]> {
   }
 }
 
-// Call a function via WebSocket with progress support
-async function callFunction(
-  namespace: string,
-  funcName: string,
-  args: Record<string, unknown>
-): Promise<unknown> {
-  return new Promise((resolve, reject) => {
-    let ws: WebSocket;
+// Timeout configuration (in milliseconds)
+const WS_CONFIG = {
+  CONNECT_TIMEOUT_MS: 5000,   // Time to establish connection
+  REQUEST_TIMEOUT_MS: 30000,  // Initial timeout for RPC calls
+  PROGRESS_TIMEOUT_MS: 60000, // Extended timeout when progress is received
+};
 
-    try {
-      ws = new WebSocket(LOOTBOX_URL);
-    } catch (error) {
-      reject(new Error(`Failed to create WebSocket connection to ${LOOTBOX_URL}: ${error}`));
-      return;
+/**
+ * Persistent WebSocket Connection
+ *
+ * Maintains a single persistent WebSocket connection to avoid the overhead
+ * of creating a new connection for every RPC call. Reconnects lazily on
+ * next call if the connection drops.
+ *
+ * This was added to address CPU/performance issues from connection churn.
+ * See council recommendations from CPU investigation.
+ */
+class PersistentWebSocket {
+  private ws: WebSocket | null = null;
+  private pendingCalls = new Map<string, {
+    resolve: (value: unknown) => void;
+    reject: (reason: Error) => void;
+    timeout: ReturnType<typeof setTimeout>;
+    method: string;
+  }>();
+  private connectionPromise: Promise<WebSocket> | null = null;
+  private connectionReject: ((reason: Error) => void) | null = null;
+  private callCounter = 0;
+
+  /**
+   * Get or create a WebSocket connection
+   */
+  private async getConnection(): Promise<WebSocket> {
+    // If we have an open connection, reuse it
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      return this.ws;
     }
 
-    const callId = `call_${Date.now()}`;
-    let timeout: ReturnType<typeof setTimeout>;
-    let connectionTimeout: ReturnType<typeof setTimeout>;
+    // If a connection is in progress, wait for it
+    if (this.connectionPromise) {
+      return this.connectionPromise;
+    }
 
-    // Helper to reset the timeout - called when progress is received
-    const resetTimeout = (timeoutMs: number = 60000) => {
-      clearTimeout(timeout);
-      timeout = setTimeout(() => {
+    // Create a new connection
+    this.connectionPromise = new Promise<WebSocket>((resolve, reject) => {
+      // Store reject so onclose/onerror can use it if connection fails before onopen
+      this.connectionReject = reject;
+
+      const ws = new WebSocket(LOOTBOX_URL);
+
+      const connectionTimeout = setTimeout(() => {
         ws.close();
-        reject(new Error(`RPC call timeout for ${namespace}.${funcName} (no progress for ${timeoutMs / 1000}s)`));
-      }, timeoutMs);
-    };
+        this.connectionPromise = null;
+        this.connectionReject = null;
+        reject(new Error(`WebSocket connection timeout. Cannot connect to ${LOOTBOX_URL}. Is the lootbox server running?`));
+      }, WS_CONFIG.CONNECT_TIMEOUT_MS);
 
-    // Connection timeout - if we don't connect within 5 seconds, fail
-    connectionTimeout = setTimeout(() => {
-      ws.close();
-      reject(new Error(`WebSocket connection timeout. Cannot connect to ${LOOTBOX_URL}. Is the lootbox server running on port 3456?`));
-    }, 5000);
+      ws.onopen = () => {
+        clearTimeout(connectionTimeout);
+        this.ws = ws;
+        this.connectionPromise = null;
+        this.connectionReject = null;
+        console.error(`[MCP Bridge] WebSocket connected to ${LOOTBOX_URL}`);
+        resolve(ws);
+      };
 
-    ws.onopen = () => {
-      clearTimeout(connectionTimeout);
+      ws.onmessage = (event) => {
+        this.handleMessage(event.data);
+      };
 
-      // Inject client cwd so tools know the user's working directory
+      ws.onerror = () => {
+        clearTimeout(connectionTimeout);
+        // Don't clear connectionPromise here - let onclose handle it
+        // Error details will be in onclose
+      };
+
+      ws.onclose = (event) => {
+        clearTimeout(connectionTimeout);
+        this.ws = null;
+
+        // If connection failed before onopen, reject the connection promise
+        if (this.connectionReject) {
+          this.connectionPromise = null;
+          const rejectFn = this.connectionReject;
+          this.connectionReject = null;
+          rejectFn(new Error(`WebSocket connection failed (code: ${event.code})`));
+          return;
+        }
+
+        this.connectionPromise = null;
+
+        // Reject all pending calls
+        for (const [, pending] of this.pendingCalls) {
+          clearTimeout(pending.timeout);
+          pending.reject(new Error(`WebSocket closed during ${pending.method} (code: ${event.code})`));
+        }
+        this.pendingCalls.clear();
+
+        if (!event.wasClean) {
+          console.error(`[MCP Bridge] WebSocket disconnected (code: ${event.code})`);
+        }
+      };
+    });
+
+    return this.connectionPromise;
+  }
+
+  /**
+   * Handle incoming WebSocket messages
+   */
+  private handleMessage(data: string): void {
+    try {
+      const response = JSON.parse(data);
+
+      // Ignore welcome messages
+      if (response.type === "welcome") return;
+
+      // Handle progress messages
+      if (response.type === "progress" && response.id) {
+        const pending = this.pendingCalls.get(response.id);
+        if (pending) {
+          console.error(`[MCP Bridge] Progress for ${pending.method}: ${response.message}`);
+          // Clear old timeout BEFORE setting new one to prevent leak
+          clearTimeout(pending.timeout);
+          pending.timeout = setTimeout(() => {
+            this.pendingCalls.delete(response.id);
+            pending.reject(new Error(`RPC call timeout for ${pending.method} (no progress for ${WS_CONFIG.PROGRESS_TIMEOUT_MS / 1000}s)`));
+          }, WS_CONFIG.PROGRESS_TIMEOUT_MS);
+        }
+        return;
+      }
+
+      // Handle response messages
+      if (response.id) {
+        const pending = this.pendingCalls.get(response.id);
+        if (pending) {
+          clearTimeout(pending.timeout);
+          this.pendingCalls.delete(response.id);
+
+          if (response.error) {
+            pending.reject(new Error(`RPC error from ${pending.method}: ${response.error}`));
+          } else {
+            pending.resolve(response.result);
+          }
+        }
+      }
+    } catch (error) {
+      console.error(`[MCP Bridge] Failed to parse message: ${error}`);
+    }
+  }
+
+  /**
+   * Call an RPC function
+   */
+  async call(
+    namespace: string,
+    funcName: string,
+    args: Record<string, unknown>
+  ): Promise<unknown> {
+    const method = `${namespace}.${funcName}`;
+    const callId = `call_${Date.now()}_${++this.callCounter}`;
+
+    // Get or create connection
+    const ws = await this.getConnection();
+
+    return new Promise((resolve, reject) => {
+      // Check readyState before sending to avoid TOCTOU race
+      // Connection could have closed between getConnection() and now
+      if (ws.readyState !== WebSocket.OPEN) {
+        this.ws = null; // Force reconnection on next call
+        reject(new Error(`WebSocket not open (state: ${ws.readyState}), will reconnect on next call`));
+        return;
+      }
+
+      // Set up timeout
+      const timeout = setTimeout(() => {
+        this.pendingCalls.delete(callId);
+        reject(new Error(`RPC call timeout for ${method} (no response for ${WS_CONFIG.REQUEST_TIMEOUT_MS / 1000}s)`));
+      }, WS_CONFIG.REQUEST_TIMEOUT_MS);
+
+      // Register pending call
+      this.pendingCalls.set(callId, { resolve, reject, timeout, method });
+
+      // Send the request with error handling for stale connections
       const enrichedArgs = {
         ...args,
         _client_cwd: process.cwd(),
       };
 
-      ws.send(
-        JSON.stringify({
-          method: `${namespace}.${funcName}`,
+      try {
+        ws.send(JSON.stringify({
+          method,
           args: enrichedArgs,
           id: callId,
-        })
-      );
-
-      // Initial timeout of 30s, will be reset on progress
-      resetTimeout(30000);
-    };
-
-    ws.onmessage = (event) => {
-      try {
-        const response = JSON.parse(event.data);
-        if (response.type === "welcome") return;
-
-        // Handle progress messages - reset timeout to allow more time
-        if (response.type === "progress" && response.id === callId) {
-          console.error(`[MCP Bridge] Progress for ${namespace}.${funcName}: ${response.message}`);
-          resetTimeout(60000); // Reset to 60s on each progress update
-          return;
-        }
-
-        if (response.id === callId) {
-          clearTimeout(timeout);
-          ws.close();
-
-          if (response.error) {
-            reject(new Error(`RPC error from ${namespace}.${funcName}: ${response.error}`));
-          } else {
-            resolve(response.result);
-          }
-        }
-      } catch (error) {
+        }));
+      } catch (sendError) {
+        // Send failed - connection is stale
         clearTimeout(timeout);
-        ws.close();
-        reject(new Error(`Failed to parse response from ${namespace}.${funcName}: ${error}`));
+        this.pendingCalls.delete(callId);
+        this.ws = null; // Force reconnection on next call
+        reject(new Error(`Failed to send RPC call: ${sendError}`));
       }
-    };
+    });
+  }
 
-    ws.onerror = (error) => {
-      clearTimeout(connectionTimeout);
-      clearTimeout(timeout);
+  /**
+   * Close the connection
+   */
+  close(): void {
+    if (this.ws) {
+      this.ws.close();
+      this.ws = null;
+    }
+    for (const [, pending] of this.pendingCalls) {
+      clearTimeout(pending.timeout);
+    }
+    this.pendingCalls.clear();
+  }
+}
 
-      // Provide helpful error message
-      const errorMsg = `WebSocket error connecting to ${LOOTBOX_URL}. ` +
-        `Possible causes:\n` +
-        `  1. Lootbox server is not running (start with: bun run src/lootbox-cli.ts server --port 3456)\n` +
-        `  2. Server is running on a different port\n` +
-        `  3. A stale server process is blocking the port (kill with: pkill -f "lootbox-cli.ts server")`;
+// Singleton persistent connection
+const wsConnection = new PersistentWebSocket();
 
-      reject(new Error(errorMsg));
-    };
+// Graceful shutdown handlers
+process.on('SIGINT', () => {
+  wsConnection.close();
+  process.exit(0);
+});
 
-    ws.onclose = (event) => {
-      clearTimeout(connectionTimeout);
-      clearTimeout(timeout);
+process.on('SIGTERM', () => {
+  wsConnection.close();
+  process.exit(0);
+});
 
-      if (!event.wasClean && event.code !== 1000) {
-        reject(new Error(`WebSocket closed unexpectedly (code: ${event.code}, reason: ${event.reason || "none"})`));
-      }
-    };
-  });
+// Call a function via WebSocket with persistent connection
+async function callFunction(
+  namespace: string,
+  funcName: string,
+  args: Record<string, unknown>
+): Promise<unknown> {
+  return wsConnection.call(namespace, funcName, args);
 }
 
 // Create and start the MCP server
