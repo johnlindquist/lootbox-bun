@@ -9,7 +9,7 @@
  * Structure: Hook → Mental Model Shift → Core Sections → Demonstrations → Impact
  */
 
-import { createLogger, extractErrorMessage, type ProgressCallback } from "./shared/index.ts";
+import { createLogger, extractErrorMessage, type ProgressCallback, getCodeMapContext } from "./shared/index.ts";
 
 const log = createLogger("article");
 
@@ -586,6 +586,7 @@ Return the complete corrected article:`;
 
   const claudeArgs = [
     "-p",
+    "--verbose", // Required when using -p with --output-format stream-json
     "--model", "opus",
     "--append-system-prompt", "You are a technical editor. Correct code errors while preserving the article's voice.",
     "--output-format", "stream-json",
@@ -652,6 +653,7 @@ Return the complete corrected article:`;
  * @param args.verify - Whether to verify code snippets (default: true)
  * @param args.auto_correct - Whether to auto-correct issues found (default: true)
  * @param args.timeout_seconds - Timeout in seconds (default: 600 for full pipeline)
+ * @param args.include_codemap - Include codebase structure context (default: true)
  */
 export async function generate(args: {
   topic: string;
@@ -663,6 +665,8 @@ export async function generate(args: {
   verify?: boolean;
   auto_correct?: boolean;
   timeout_seconds?: number;
+  /** Include codebase structure context (default: true) */
+  include_codemap?: boolean;
 }): Promise<ArticleResult> {
   log.call("generate", { ...args, research_context: args.research_context ? "[provided]" : undefined });
 
@@ -676,6 +680,7 @@ export async function generate(args: {
     verify: doVerify = true,
     auto_correct = true,
     timeout_seconds = 600,
+    include_codemap = true,
   } = args;
 
   if (!topic || topic.trim().length === 0) {
@@ -687,6 +692,19 @@ export async function generate(args: {
   const startTime = Date.now();
   const timeout = timeout_seconds * 1000;
 
+  // Get code map context for codebase awareness (if enabled)
+  let codebaseContext = "";
+  if (include_codemap) {
+    sendProgress("[Article] Loading codebase structure...");
+    const codeMapContext = await getCodeMapContext();
+    if (codeMapContext) {
+      codebaseContext = `\n\n<codebase-structure>\n${codeMapContext}\n</codebase-structure>`;
+      log.info(`Loaded code map context (${codeMapContext.length} chars)`);
+    } else {
+      log.info("No code map available (not a git repo or generation failed)");
+    }
+  }
+
   // Build the target word count
   const wordCounts = { short: 800, medium: 1500, long: 2500 };
   const targetWords = wordCounts[target_length];
@@ -694,13 +712,13 @@ export async function generate(args: {
   // Get the relevant example excerpt
   const exampleExcerpt = EXAMPLE_EXCERPTS[style] || EXAMPLE_EXCERPTS["ai-sdk"];
 
-  // Build the generation prompt
+  // Build the generation prompt with codemap context
   const prompt = buildArticlePrompt({
     topic,
     title,
     style,
     exampleExcerpt,
-    research_context,
+    research_context: research_context ? `${research_context}${codebaseContext}` : codebaseContext || undefined,
     targetWords,
   });
 
@@ -710,6 +728,7 @@ export async function generate(args: {
     // Use Claude Opus with extended thinking for quality writing
     const claudeArgs = [
       "-p",
+      "--verbose", // Required when using -p with --output-format stream-json
       "--model", "opus",
       "--append-system-prompt", "You are an expert technical writer. Think deeply about structure, clarity, and impact before writing. Ensure all code examples are accurate and use current APIs.",
       "--output-format", "stream-json",
@@ -1019,6 +1038,7 @@ Write the revised article now:`;
   try {
     const claudeArgs = [
       "-p",
+      "--verbose", // Required when using -p with --output-format stream-json
       "--model", "opus",
       "--append-system-prompt", "You are an expert technical editor. Revise carefully while preserving voice and style.",
       "--output-format", "stream-json",

@@ -274,10 +274,16 @@ async function callFunction(
     ws.onopen = () => {
       clearTimeout(connectionTimeout);
 
+      // Inject client cwd so tools know the user's working directory
+      const enrichedArgs = {
+        ...args,
+        _client_cwd: process.cwd(),
+      };
+
       ws.send(
         JSON.stringify({
           method: `${namespace}.${funcName}`,
-          args: args,
+          args: enrichedArgs,
           id: callId,
         })
       );
@@ -379,8 +385,8 @@ async function main() {
       lastFetchError = null;
 
       const tools: ToolSchema[] = cachedFunctions.map((func) => ({
-        name: `${func.namespace}__${func.name}`,
-        description: `Call ${func.namespace}.${func.name}() on the lootbox RPC server`,
+        name: `lootbox__${func.namespace}__${func.name}`,
+        description: `[Lootbox System Tool] ${func.namespace}.${func.name} - Internal helper tool for AI workflows. Not related to project code.`,
         inputSchema: {
           type: "object" as const,
           properties: func.properties,
@@ -403,8 +409,10 @@ async function main() {
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name, arguments: args } = request.params;
 
-    // Parse namespace and function name from tool name (format: namespace__funcname)
-    const [namespace, ...funcParts] = name.split("__");
+    // Parse namespace and function name from tool name (format: lootbox__namespace__funcname)
+    // Strip "lootbox__" prefix if present for backwards compatibility
+    const normalizedName = name.startsWith("lootbox__") ? name.slice(9) : name;
+    const [namespace, ...funcParts] = normalizedName.split("__");
     const funcName = funcParts.join("__");
 
     if (!namespace || !funcName) {
@@ -412,7 +420,7 @@ async function main() {
         content: [
           {
             type: "text",
-            text: `Error: Invalid tool name format "${name}". Expected format: namespace__functionname`,
+            text: `Error: Invalid tool name format "${name}". Expected format: lootbox__namespace__functionname`,
           },
         ],
         isError: true,

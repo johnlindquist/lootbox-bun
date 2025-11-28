@@ -42,3 +42,26 @@ export const ClientCodeResponseSchema = z.string().openapi({
   description: "Generated RPC client code for browser/Deno usage",
   example: "export class RpcClient {\n  async call(method: string, args: any) { ... }\n}",
 });
+
+// Metrics endpoint schemas
+export const MetricsResponseSchema = z.string().openapi({
+  description: "Prometheus-format metrics for monitoring",
+  example: "# HELP lootbox_rpc_calls_total Total number of RPC calls\n# TYPE lootbox_rpc_calls_total counter\nlootbox_rpc_calls_total{tool=\"gemini\",method=\"research\",status=\"success\"} 42",
+});
+
+// Stats endpoint schemas
+export const StatsResponseSchema = z.object({
+  workers: z.object({
+    total: z.number(),
+    ready: z.number(),
+    failed: z.number(),
+    pending_calls: z.number(),
+  }),
+  circuit_breakers: z.record(z.object({
+    state: z.enum(["closed", "open", "half-open"]),
+    failures: z.number(),
+    successes: z.number(),
+    fallbacks: z.number(),
+  }).nullable()),
+  uptime_seconds: z.number(),
+});

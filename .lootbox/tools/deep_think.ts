@@ -18,7 +18,7 @@
  * 6. Conclude: Produce structured reasoning output
  */
 
-import { createLogger, extractErrorMessage, type ProgressCallback } from "./shared/index.ts";
+import { createLogger, extractErrorMessage, type ProgressCallback, getCodeMapContext, spawnWithTimeout } from "./shared/index.ts";
 import { saveToolResponse } from "./shared/response_history.ts";
 
 const log = createLogger("deep_think");
@@ -185,6 +185,7 @@ function parseCodexJsonl(rawOutput: string): string {
 
 /**
  * Query a single agent for reasoning
+ * Uses spawnWithTimeout to properly kill subprocess on timeout
  */
 async function queryAgentForThinking(
   agentKey: AgentName,
@@ -193,80 +194,58 @@ async function queryAgentForThinking(
   timeout = 180000
 ): Promise<AgentThought> {
   const agent = AGENTS[agentKey];
-  const startTime = Date.now();
 
   log.info(`Querying ${agent.name}${framework ? ` (${framework})` : ""}...`);
   sendProgress(`[${agent.name}] Starting reasoning${framework ? ` using ${framework}` : ""}...`);
 
-  try {
-    const proc = Bun.spawn([agent.command, ...agent.args, prompt], {
-      stdout: "pipe",
-      stderr: "pipe",
-      env: { ...process.env, CI: "true", TERM: "dumb" },
-    });
+  // Use spawnWithTimeout for proper timeout handling and process cleanup
+  const result = await spawnWithTimeout({
+    command: agent.command,
+    args: [...agent.args, prompt],
+    timeoutMs: timeout,
+    env: { CI: "true", TERM: "dumb" },
+    onProgress: (chars, elapsedMs) => {
+      const elapsed = Math.round(elapsedMs / 1000);
+      sendProgress(`[${agent.name}] Thinking... (${elapsed}s, ${chars} chars)`);
+    },
+    progressIntervalMs: 5000,
+  });
 
-    // Stream with progress updates
-    let response = "";
-    let charCount = 0;
-    const reader = proc.stdout.getReader();
-    const decoder = new TextDecoder();
-
-    // Progress reporter
-    const progressInterval = setInterval(() => {
-      const elapsed = Math.round((Date.now() - startTime) / 1000);
-      sendProgress(`[${agent.name}] Thinking... (${elapsed}s, ${charCount} chars)`);
-    }, 5000);
-
-    try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        const chunk = decoder.decode(value, { stream: true });
-        response += chunk;
-        charCount += chunk.length;
-      }
-    } finally {
-      clearInterval(progressInterval);
-    }
-
-    const stderr = await new Response(proc.stderr).text();
-    const exitCode = await proc.exited;
-    const duration_ms = Date.now() - startTime;
-
-    if (exitCode !== 0) {
-      return {
-        agent: agent.name,
-        framework,
-        success: false,
-        error: stderr || `Exit code ${exitCode}`,
-        duration_ms,
-      };
-    }
-
-    // Parse output based on agent type
-    let reasoning = response.trim();
-    if (agentKey === "codex") {
-      reasoning = parseCodexJsonl(reasoning);
-    }
-
-    sendProgress(`[${agent.name}] Completed in ${(duration_ms / 1000).toFixed(1)}s`);
-
+  if (result.timedOut) {
     return {
       agent: agent.name,
       framework,
-      success: true,
-      reasoning,
-      duration_ms,
-    };
-  } catch (error) {
-    return {
-      agent: AGENTS[agentKey].name,
-      framework,
       success: false,
-      error: extractErrorMessage(error),
-      duration_ms: Date.now() - startTime,
+      error: `Agent timed out after ${timeout / 1000}s (process was killed)`,
+      duration_ms: result.durationMs,
     };
   }
+
+  if (!result.success) {
+    return {
+      agent: agent.name,
+      framework,
+      success: false,
+      error: result.error || result.stderr || `Exit code ${result.exitCode}`,
+      duration_ms: result.durationMs,
+    };
+  }
+
+  // Parse output based on agent type
+  let reasoning = result.stdout.trim();
+  if (agentKey === "codex") {
+    reasoning = parseCodexJsonl(reasoning);
+  }
+
+  sendProgress(`[${agent.name}] Completed in ${(result.durationMs / 1000).toFixed(1)}s`);
+
+  return {
+    agent: agent.name,
+    framework,
+    success: true,
+    reasoning,
+    duration_ms: result.durationMs,
+  };
 }
 
 // ============================================================================
@@ -318,6 +297,8 @@ export async function deep_think(args: {
   frameworks?: FrameworkKey[];
   context?: string;
   timeout_seconds?: number;
+  /** Include codebase structure context (default: true) */
+  include_codemap?: boolean;
 }): Promise<DeepThinkResult> {
   log.call("deep_think", args);
   const {
@@ -326,6 +307,7 @@ export async function deep_think(args: {
     frameworks,
     context,
     timeout_seconds = 300,
+    include_codemap = true,
   } = args;
 
   if (!problem || problem.trim().length === 0) {
@@ -347,6 +329,19 @@ export async function deep_think(args: {
 
   const startTime = Date.now();
 
+  // Get code map context for codebase awareness (if enabled)
+  let codebaseSection = "";
+  if (include_codemap) {
+    sendProgress("Loading codebase structure...");
+    const codeMapContext = await getCodeMapContext();
+    if (codeMapContext) {
+      codebaseSection = `\n\n<codebase-structure>\n${codeMapContext}\n</codebase-structure>\n`;
+      log.info(`Loaded code map context (${codeMapContext.length} chars)`);
+    } else {
+      log.info("No code map available (not a git repo or generation failed)");
+    }
+  }
+
   // Select frameworks based on depth
   const defaultFrameworks: FrameworkKey[][] = {
     quick: ["first_principles", "pragmatic"],
@@ -357,10 +352,10 @@ export async function deep_think(args: {
   const selectedFrameworks = frameworks || defaultFrameworks[depth];
   sendProgress(`Starting deep thinking on: ${problem.substring(0, 50)}... (${depth} depth, ${selectedFrameworks.length} frameworks)`);
 
-  // Build context-aware problem statement
+  // Build context-aware problem statement with codebase structure
   const fullProblem = context
-    ? `Problem: ${problem}\n\nContext/Constraints: ${context}`
-    : `Problem: ${problem}`;
+    ? `Problem: ${problem}\n\nContext/Constraints: ${context}${codebaseSection}`
+    : `Problem: ${problem}${codebaseSection}`;
 
   // Step 1: Query agents with different frameworks in parallel
   sendProgress("Initiating multi-framework reasoning...");

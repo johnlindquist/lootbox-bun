@@ -7,7 +7,7 @@
  * Implements direct MCP-over-HTTP communication with the DeepWiki server.
  */
 
-import { createLogger, extractErrorMessage, type McpSession } from "./shared/index.ts";
+import { createLogger, extractErrorMessage, type McpSession, getCodeMapContext } from "./shared/index.ts";
 
 const DEEPWIKI_MCP_URL = "https://mcp.deepwiki.com/mcp";
 
@@ -242,15 +242,20 @@ export async function read_wiki_contents(args: {
  * Ask any question about a GitHub repository and get an AI-powered answer.
  * This is the most powerful tool - provides semantic understanding of the codebase.
  *
+ * Optionally includes your local codebase structure to help tailor answers to your project.
+ *
  * @param args.repo_name - GitHub repository in format 'owner/repo' (e.g., 'anthropics/claude-code')
  * @param args.question - The question to ask about the repository
+ * @param args.include_codemap - Include local codebase context to help tailor the answer (default: true)
  */
 export async function ask_question(args: {
   repo_name: string;
   question: string;
+  /** Include local codebase context to help tailor the answer (default: true) */
+  include_codemap?: boolean;
 }): Promise<{ success: boolean; answer?: string; error?: string }> {
   log.call("ask_question", args);
-  const { repo_name, question } = args;
+  const { repo_name, question, include_codemap = true } = args;
 
   // Validate repo format
   if (!repo_name.includes("/")) {
@@ -265,9 +270,19 @@ export async function ask_question(args: {
     return { success: false, error: err };
   }
 
+  // Optionally include codebase context to help tailor the answer
+  let enhancedQuestion = question;
+  if (include_codemap) {
+    const codeMapContext = await getCodeMapContext();
+    if (codeMapContext) {
+      enhancedQuestion = `${question}\n\n<my-codebase-context>\nI'm working on a project with this structure:\n${codeMapContext}\n</my-codebase-context>`;
+      log.info(`Enhanced question with codemap context (${codeMapContext.length} chars)`);
+    }
+  }
+
   const result = await callDeepWikiTool("ask_question", {
     repoName: repo_name,
-    question: question,
+    question: enhancedQuestion,
   });
 
   if (result.success) {

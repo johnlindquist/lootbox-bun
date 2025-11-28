@@ -18,6 +18,8 @@ import { OpenAPIHono, createRoute } from "@hono/zod-openapi";
 import {
   ClientCodeResponseSchema,
   HealthResponseSchema,
+  MetricsResponseSchema,
+  StatsResponseSchema,
   NamespaceTypesParamSchema,
   NamespaceTypesResponseSchema,
   NamespacesResponseSchema,
@@ -27,21 +29,31 @@ import {
 import type { McpIntegrationManager } from "./mcp_integration_manager.ts";
 import type { RpcCacheManager } from "./rpc_cache_manager.ts";
 import type { TypeGeneratorManager } from "./type_generator_manager.ts";
+import type { WorkerManager } from "../worker_manager.ts";
 import { VERSION } from "../../../version.ts";
+import {
+  getMetrics,
+  getMetricsContentType,
+  getAllCircuitBreakerStats,
+} from "../../observability/index.ts";
 
 export class OpenApiRouteHandler {
+  private startTime = Date.now();
+
   constructor(
     private app: OpenAPIHono,
     private rpcCacheManager: RpcCacheManager,
     private typeGeneratorManager: TypeGeneratorManager,
     private mcpIntegrationManager: McpIntegrationManager,
     private clientCacheGetter: () => { code: string },
-    private port: number
+    private port: number,
+    private workerManagerGetter?: () => WorkerManager | null
   ) {}
 
   setupRoutes(): void {
     this.setupHealthRoutes();
     this.setupTypeRoutes();
+    this.setupMetricsRoutes();
     this.setupDocRoutes();
   }
 
@@ -69,9 +81,33 @@ export class OpenApiRouteHandler {
         },
       }),
       (c) => {
-        return c.json({
-          status: "ok",
-        });
+        // Get health monitor status if available
+        try {
+          const { getHealthMonitor } = require("./health_monitor.ts");
+          const healthMonitor = getHealthMonitor();
+          const healthStatus = healthMonitor.getStatus();
+
+          return c.json({
+            status: healthStatus.healthy ? "ok" : "degraded",
+            healthy: healthStatus.healthy,
+            warnings: healthStatus.warnings,
+            metrics: {
+              memory: {
+                heapUsedMB: Math.round(healthStatus.metrics.memoryUsage.heapUsed / 1024 / 1024),
+                heapTotalMB: Math.round(healthStatus.metrics.memoryUsage.heapTotal / 1024 / 1024),
+                rssMB: Math.round(healthStatus.metrics.memoryUsage.rss / 1024 / 1024),
+              },
+              eventLoopLagMs: Math.round(healthStatus.metrics.eventLoopLag),
+              activeHandles: healthStatus.metrics.activeHandles,
+              activeRequests: healthStatus.metrics.activeRequests,
+            }
+          });
+        } catch {
+          // Fallback if health monitor not available
+          return c.json({
+            status: "ok",
+          });
+        }
       }
     );
 
@@ -242,6 +278,81 @@ export class OpenApiRouteHandler {
   }
 
   /**
+   * Metrics and observability routes
+   */
+  private setupMetricsRoutes(): void {
+    // Prometheus metrics endpoint
+    this.app.openapi(
+      createRoute({
+        method: "get",
+        path: "/metrics",
+        tags: ["Observability"],
+        summary: "Get Prometheus metrics",
+        description:
+          "Returns all server metrics in Prometheus text format. Use for scraping by Prometheus or compatible monitoring systems.",
+        responses: {
+          200: {
+            description: "Prometheus-format metrics",
+            content: {
+              "text/plain": {
+                schema: MetricsResponseSchema,
+              },
+            },
+          },
+        },
+      }),
+      async (c) => {
+        const metrics = await getMetrics();
+        return c.text(metrics, 200, {
+          "Content-Type": getMetricsContentType(),
+        });
+      }
+    );
+
+    // Stats endpoint (JSON format for dashboards)
+    this.app.openapi(
+      createRoute({
+        method: "get",
+        path: "/stats",
+        tags: ["Observability"],
+        summary: "Get server statistics",
+        description:
+          "Returns detailed server statistics in JSON format including worker status, circuit breaker states, and uptime.",
+        responses: {
+          200: {
+            description: "Server statistics",
+            content: {
+              "application/json": {
+                schema: StatsResponseSchema,
+              },
+            },
+          },
+        },
+      }),
+      (c) => {
+        const workerManager = this.workerManagerGetter?.();
+        const workerStats = workerManager?.getStats() ?? {
+          totalWorkers: 0,
+          readyWorkers: 0,
+          failedWorkers: 0,
+          pendingCalls: 0,
+        };
+
+        return c.json({
+          workers: {
+            total: workerStats.totalWorkers,
+            ready: workerStats.readyWorkers,
+            failed: workerStats.failedWorkers,
+            pending_calls: workerStats.pendingCalls,
+          },
+          circuit_breakers: getAllCircuitBreakerStats(),
+          uptime_seconds: Math.floor((Date.now() - this.startTime) / 1000),
+        });
+      }
+    );
+  }
+
+  /**
    * OpenAPI documentation routes
    */
   private setupDocRoutes(): void {
@@ -276,6 +387,10 @@ export class OpenApiRouteHandler {
         {
           name: "Client",
           description: "RPC client code generation",
+        },
+        {
+          name: "Observability",
+          description: "Metrics, statistics, and monitoring endpoints",
         },
       ],
     });

@@ -15,7 +15,7 @@
  * - Role-based queries: specialized personas per agent
  */
 
-import { createLogger, extractErrorMessage, type ProgressCallback } from "./shared/index.ts";
+import { createLogger, extractErrorMessage, type ProgressCallback, getCodeMapContext, spawnWithTimeout } from "./shared/index.ts";
 import { saveToolResponse } from "./shared/response_history.ts";
 
 const log = createLogger("council");
@@ -40,7 +40,8 @@ const AGENTS = {
     name: "Claude (Opus ultrathink)",
     command: "claude",
     // Use opus model with ultrathink, stream-json for continuous output
-    args: ["-p", "--model", "opus", "--append-system-prompt", "ultrathink", "--output-format", "stream-json"],
+    // Note: --verbose is required when using -p with --output-format stream-json
+    args: ["-p", "--verbose", "--model", "opus", "--append-system-prompt", "ultrathink", "--output-format", "stream-json"],
     description: "Anthropic's most capable model with extended thinking enabled",
     parseOutput: "stream-json", // Parse stream-json format
   },
@@ -239,6 +240,7 @@ interface CouncilResult {
 
 /**
  * Run a single agent query with streaming progress
+ * Uses spawnWithTimeout for proper timeout handling and process cleanup
  */
 async function queryAgent(
   agentKey: AgentName,
@@ -247,155 +249,81 @@ async function queryAgent(
   role?: string
 ): Promise<AgentResponse> {
   const agent = AGENTS[agentKey];
-  const startTime = Date.now();
 
   log.info(`Querying ${agent.name}...`);
   sendProgress(`[${agent.name}] Starting query...`);
 
-  try {
-    // Build the command with optional role
-    let args = [...agent.args];
+  // Build the command with optional role
+  let args = [...agent.args];
+  let modifiedQuestion = question;
 
-    // Add role/system prompt if provided
-    if (role) {
-      if (agentKey === "claude") {
-        // Claude uses --append-system-prompt for additional system context
-        args = args.filter(a => a !== "ultrathink"); // Remove default
-        args.push("--append-system-prompt", `${role}\n\nThink deeply and carefully.`);
-      } else if (agentKey === "codex") {
-        // Codex: prepend role to the question
-        question = `[System: ${role}]\n\n${question}`;
-      } else if (agentKey === "gemini") {
-        // Gemini: prepend role to the question
-        question = `[System: ${role}]\n\n${question}`;
-      }
+  // Add role/system prompt if provided
+  if (role) {
+    if (agentKey === "claude") {
+      // Claude uses --append-system-prompt for additional system context
+      args = args.filter(a => a !== "ultrathink"); // Remove default
+      args.push("--append-system-prompt", `${role}\n\nThink deeply and carefully.`);
+    } else if (agentKey === "codex") {
+      // Codex: prepend role to the question
+      modifiedQuestion = `[System: ${role}]\n\n${question}`;
+    } else if (agentKey === "gemini") {
+      // Gemini: prepend role to the question
+      modifiedQuestion = `[System: ${role}]\n\n${question}`;
     }
+  }
 
-    args.push(question);
+  args.push(modifiedQuestion);
 
-    log.debug(`Running: ${agent.command} ${args.join(" ")}`);
+  log.debug(`Running: ${agent.command} ${args.join(" ").substring(0, 100)}...`);
 
-    const proc = Bun.spawn([agent.command, ...args], {
-      stdout: "pipe",
-      stderr: "pipe",
-      env: {
-        ...process.env,
-        // Ensure non-interactive mode
-        CI: "true",
-        TERM: "dumb",
-      },
-    });
+  // Use spawnWithTimeout for proper timeout handling and process cleanup
+  const result = await spawnWithTimeout({
+    command: agent.command,
+    args,
+    timeoutMs: timeout,
+    env: { CI: "true", TERM: "dumb" },
+    onProgress: (chars, elapsedMs) => {
+      const elapsed = Math.round(elapsedMs / 1000);
+      sendProgress(`[${agent.name}] Thinking... (${elapsed}s, ${chars} chars)`);
+    },
+    progressIntervalMs: 3000,
+  });
 
-    // Stream stdout and collect response while sending progress
-    let response = "";
-    let charCount = 0;
-    const progressInterval = 3000; // Send progress every 3 seconds (more frequent to avoid RPC timeout)
-
-    // Read stdout in chunks for streaming progress
-    const reader = proc.stdout.getReader();
-    const decoder = new TextDecoder();
-
-    // Set up timeout that we can cancel
-    let timeoutId: ReturnType<typeof setTimeout> | null = null;
-    let timedOut = false;
-
-    const resetTimeout = () => {
-      if (timeoutId) clearTimeout(timeoutId);
-      timeoutId = setTimeout(() => {
-        timedOut = true;
-        proc.kill();
-      }, timeout);
-    };
-
-    resetTimeout();
-
-    // Progress reporter that runs periodically - CRITICAL for keeping RPC alive
-    // Uses setInterval which runs independently of the read() blocking call
-    let progressCount = 0;
-    const progressReporter = setInterval(() => {
-      progressCount++;
-      const elapsed = Math.round((Date.now() - startTime) / 1000);
-      const status = charCount === 0 ? "waiting for response" : `${charCount} chars received`;
-      const preview = response.length > 100
-        ? `...${response.slice(-100).replace(/\n/g, " ")}`
-        : response.replace(/\n/g, " ");
-      const progressMsg = `[${agent.name}] ${elapsed}s elapsed, ${status}${preview ? `: "${preview.slice(0, 50)}..."` : ""}`;
-      sendProgress(progressMsg);
-      log.debug(`Progress #${progressCount}: ${progressMsg}`);
-    }, progressInterval);
-
-    // Send immediate "waiting" progress to ensure RPC knows we're alive
-    sendProgress(`[${agent.name}] Spawned process, waiting for model response...`);
-
-    try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        const chunk = decoder.decode(value, { stream: true });
-        response += chunk;
-        charCount += chunk.length;
-
-        // Reset timeout on each chunk received
-        resetTimeout();
-
-        // Send immediate progress on first chunk
-        if (charCount === chunk.length) {
-          sendProgress(`[${agent.name}] Receiving response...`);
-        }
-      }
-    } finally {
-      clearInterval(progressReporter);
-      if (timeoutId) clearTimeout(timeoutId);
-    }
-
-    if (timedOut) {
-      throw new Error(`Timeout after ${timeout / 1000}s`);
-    }
-
-    // Also capture stderr
-    const stderr = await new Response(proc.stderr).text();
-    const exitCode = await proc.exited;
-    const duration_ms = Date.now() - startTime;
-
-    if (exitCode !== 0) {
-      const errorMsg = stderr || `Exit code ${exitCode}`;
-      log.error(agent.name, errorMsg);
-      return {
-        agent: agent.name,
-        model: agentKey,
-        success: false,
-        error: errorMsg,
-        duration_ms,
-      };
-    }
-
-    // Parse the streaming output to extract the actual text content
-    const parsedResponse = parseAgentOutput(response.trim(), agent.parseOutput);
-    log.success(agent.name, parsedResponse.substring(0, 200));
-    sendProgress(`[${agent.name}] Completed in ${(duration_ms / 1000).toFixed(1)}s (${charCount} chars)`);
-
+  if (result.timedOut) {
+    log.error(agent.name, `Timeout after ${timeout / 1000}s`);
     return {
       agent: agent.name,
       model: agentKey,
-      success: true,
-      response: parsedResponse,
-      duration_ms,
+      success: false,
+      error: `Agent timed out after ${timeout / 1000}s (process was killed)`,
+      duration_ms: result.durationMs,
     };
-  } catch (error) {
-    const duration_ms = Date.now() - startTime;
-    const errorMsg = extractErrorMessage(error);
-    log.error(agent.name, errorMsg);
-    sendProgress(`[${agent.name}] Error: ${errorMsg}`);
+  }
 
+  if (!result.success) {
+    const errorMsg = result.error || result.stderr || `Exit code ${result.exitCode}`;
+    log.error(agent.name, errorMsg);
     return {
       agent: agent.name,
       model: agentKey,
       success: false,
       error: errorMsg,
-      duration_ms,
+      duration_ms: result.durationMs,
     };
   }
+
+  // Parse the streaming output to extract the actual text content
+  const parsedResponse = parseAgentOutput(result.stdout.trim(), agent.parseOutput);
+  log.success(agent.name, parsedResponse.substring(0, 200));
+  sendProgress(`[${agent.name}] Completed in ${(result.durationMs / 1000).toFixed(1)}s`);
+
+  return {
+    agent: agent.name,
+    model: agentKey,
+    success: true,
+    response: parsedResponse,
+    duration_ms: result.durationMs,
+  };
 }
 
 /**
@@ -415,6 +343,8 @@ export async function ask(args: {
   include_summary?: boolean;
   role_preset?: RolePreset;
   roles?: Partial<Record<AgentName, string>>;
+  /** Include codebase structure context (default: true) */
+  include_codemap?: boolean;
 }): Promise<CouncilResult> {
   log.call("ask", args);
   const {
@@ -424,6 +354,7 @@ export async function ask(args: {
     include_summary = false,
     role_preset,
     roles,
+    include_codemap = true,
   } = args;
 
   // Resolve roles: custom roles override preset
@@ -443,6 +374,24 @@ export async function ask(args: {
   const startTime = Date.now();
   const timeout = timeout_seconds * 1000;
 
+  // Get code map context for codebase awareness (if enabled)
+  let codebaseSection = "";
+  if (include_codemap) {
+    sendProgress("Loading codebase structure...");
+    const codeMapContext = await getCodeMapContext();
+    if (codeMapContext) {
+      codebaseSection = `\n\n<codebase-structure>\n${codeMapContext}\n</codebase-structure>`;
+      log.info(`Loaded code map context (${codeMapContext.length} chars)`);
+    } else {
+      log.info("No code map available (not a git repo or generation failed)");
+    }
+  }
+
+  // Augment question with codebase context
+  const augmentedQuestion = codebaseSection
+    ? `${question}${codebaseSection}`
+    : question;
+
   sendProgress(`Consulting council (${agents.join(", ")})...`);
 
   // Query all agents in parallel
@@ -457,7 +406,7 @@ export async function ask(args: {
       });
     }
     const role = resolvedRoles[agentKey];
-    return queryAgent(agentKey, question, timeout, role);
+    return queryAgent(agentKey, augmentedQuestion, timeout, role);
   });
 
   const responses = await Promise.all(responsePromises);

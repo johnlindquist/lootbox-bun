@@ -13,7 +13,7 @@
  * Use this when you're truly stuck and need maximum AI firepower to break through.
  */
 
-import { createLogger, extractErrorMessage, type ProgressCallback } from "./shared/index.ts";
+import { createLogger, extractErrorMessage, type ProgressCallback, getCodeMapContext } from "./shared/index.ts";
 
 const log = createLogger("stuck");
 
@@ -58,6 +58,8 @@ interface StuckInput {
   skip?: string[];
   /** Timeout per operation in seconds (default: 180) */
   timeout_seconds?: number;
+  /** Include codebase structure context (default: true) */
+  include_codemap?: boolean;
 }
 
 interface AnalysisResult {
@@ -110,6 +112,7 @@ export async function unstuck(args: StuckInput): Promise<StuckResult> {
     attempted_solutions = [],
     skip = [],
     timeout_seconds = 180,
+    include_codemap = true,
   } = args;
 
   if (!problem || problem.trim().length === 0) {
@@ -125,8 +128,21 @@ export async function unstuck(args: StuckInput): Promise<StuckResult> {
     };
   }
 
+  // Get code map context for codebase awareness
+  let codebaseSection = "";
+  if (include_codemap) {
+    sendProgress("Loading codebase structure...");
+    const codeMapContext = await getCodeMapContext();
+    if (codeMapContext) {
+      codebaseSection = `\n\n<codebase-structure>\n${codeMapContext}\n</codebase-structure>`;
+      log.info(`Loaded code map context (${codeMapContext.length} chars)`);
+    } else {
+      log.info("No code map available (not a git repo or generation failed)");
+    }
+  }
+
   // Build enriched problem context
-  let enrichedProblem = problem;
+  let enrichedProblem = problem + codebaseSection;
   if (error_message) {
     enrichedProblem += `\n\nError message:\n\`\`\`\n${error_message}\n\`\`\``;
   }

@@ -32,10 +32,12 @@ const CHECK_INTERVAL_MS = 5000; // Check every 5 seconds
 
 export class HealthMonitor {
   private intervalId: ReturnType<typeof setInterval> | null = null;
+  private lagCheckTimeoutId: ReturnType<typeof setTimeout> | null = null; // Track for cleanup
   private lastCpuUsage: NodeJS.CpuUsage | null = null;
   private lastCheck: number = Date.now();
   private consecutiveHighCpu = 0;
   private enabled = false;
+  private lastWarningHash = ""; // Prevent duplicate warnings
 
   // Event loop lag measurement
   private lagCheckStart = 0;
@@ -72,6 +74,13 @@ export class HealthMonitor {
       clearInterval(this.intervalId);
       this.intervalId = null;
     }
+
+    // Clear the lag check timeout to prevent continued recursion
+    if (this.lagCheckTimeoutId) {
+      clearTimeout(this.lagCheckTimeoutId);
+      this.lagCheckTimeoutId = null;
+    }
+
     console.error("[HealthMonitor] Stopped health monitoring");
   }
 
@@ -83,11 +92,13 @@ export class HealthMonitor {
 
     this.lagCheckStart = performance.now();
     setImmediate(() => {
+      if (!this.enabled) return; // Check again after setImmediate
+
       const lag = performance.now() - this.lagCheckStart;
       this.lastEventLoopLag = lag;
 
-      // Reschedule
-      setTimeout(() => this.scheduleEventLoopCheck(), 1000);
+      // Reschedule - track timeout ID for cleanup
+      this.lagCheckTimeoutId = setTimeout(() => this.scheduleEventLoopCheck(), 1000);
     });
   }
 
@@ -98,21 +109,32 @@ export class HealthMonitor {
     const status = this.getStatus();
 
     if (!status.healthy) {
-      console.error(`[HealthMonitor] ⚠️  Health warnings detected:`);
-      for (const warning of status.warnings) {
-        console.error(`[HealthMonitor]   - ${warning}`);
-      }
+      // Create a hash of warnings to deduplicate repeated messages
+      const warningHash = status.warnings.sort().join("|");
 
-      // Log metrics for debugging
-      const mem = status.metrics.memoryUsage;
-      console.error(`[HealthMonitor] Metrics:`, {
-        heapUsedMB: Math.round(mem.heapUsed / 1024 / 1024),
-        heapTotalMB: Math.round(mem.heapTotal / 1024 / 1024),
-        rssMB: Math.round(mem.rss / 1024 / 1024),
-        eventLoopLagMs: Math.round(status.metrics.eventLoopLag),
-        activeHandles: status.metrics.activeHandles,
-        activeRequests: status.metrics.activeRequests,
-      });
+      // Only log if warnings changed
+      if (warningHash !== this.lastWarningHash) {
+        console.error(`[HealthMonitor] ⚠️  Health warnings detected:`);
+        for (const warning of status.warnings) {
+          console.error(`[HealthMonitor]   - ${warning}`);
+        }
+
+        // Log metrics for debugging
+        const mem = status.metrics.memoryUsage;
+        console.error(`[HealthMonitor] Metrics:`, {
+          heapUsedMB: Math.round(mem.heapUsed / 1024 / 1024),
+          heapTotalMB: Math.round(mem.heapTotal / 1024 / 1024),
+          rssMB: Math.round(mem.rss / 1024 / 1024),
+          eventLoopLagMs: Math.round(status.metrics.eventLoopLag),
+          activeHandles: status.metrics.activeHandles,
+          activeRequests: status.metrics.activeRequests,
+        });
+
+        this.lastWarningHash = warningHash;
+      }
+    } else {
+      // Clear hash when healthy
+      this.lastWarningHash = "";
     }
 
     // Track consecutive high CPU

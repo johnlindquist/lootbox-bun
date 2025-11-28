@@ -10,6 +10,8 @@ import {
   createLogger,
   extractErrorMessage,
   type ProgressCallback,
+  getCodeMapContext,
+  spawnWithTimeout,
 } from "./shared/index.ts";
 
 // Create logger for this tool
@@ -37,7 +39,7 @@ function sendProgress(message: string): void {
 
 /**
  * Execute a Gemini CLI command and return the result
- * Supports streaming progress updates to prevent timeouts on long operations
+ * Uses spawnWithTimeout for proper timeout handling and process cleanup
  *
  * Gemini CLI usage:
  * - Positional prompt: gemini -m pro "your prompt here"
@@ -50,28 +52,35 @@ async function runGemini(
 ): Promise<{ success: boolean; output: string; error?: string }> {
   const { stdin, timeout = 120000 } = options;
 
-  try {
-    log.info(`Executing Gemini with prompt: ${prompt.substring(0, 100)}...`);
-    sendProgress("Starting Gemini request...");
+  log.info(`Executing Gemini with prompt: ${prompt.substring(0, 100)}...`);
+  sendProgress("Starting Gemini request...");
 
+  if (stdin) {
+    // Stdin case: use Bun.spawn directly with manual timeout
+    // (spawnWithTimeout doesn't support stdin piping)
     const startTime = Date.now();
-
-    // Start a progress reporter that sends updates every 5 seconds
-    const progressInterval = setInterval(() => {
-      const elapsed = Math.round((Date.now() - startTime) / 1000);
-      sendProgress(`Gemini processing... (${elapsed}s elapsed)`);
-    }, 5000);
+    let timedOut = false;
 
     try {
-      if (stdin) {
-        // Pipe content through stdin - gemini will see stdin content + prompt
-        // Using raw array form to avoid shell escaping issues
-        const proc = Bun.spawn(["gemini", "-m", "pro", "-o", "text", prompt], {
-          stdin: new TextEncoder().encode(stdin),
-          stdout: "pipe",
-          stderr: "pipe",
-        });
+      const proc = Bun.spawn(["gemini", "-m", "pro", "-o", "text", prompt], {
+        stdin: new TextEncoder().encode(stdin),
+        stdout: "pipe",
+        stderr: "pipe",
+      });
 
+      // Set up timeout
+      const timeoutId = setTimeout(() => {
+        timedOut = true;
+        try { proc.kill(9); } catch { /* already dead */ }
+      }, timeout);
+
+      // Progress reporter
+      const progressInterval = setInterval(() => {
+        const elapsed = Math.round((Date.now() - startTime) / 1000);
+        sendProgress(`Gemini processing... (${elapsed}s elapsed)`);
+      }, 5000);
+
+      try {
         const [stdout, stderr] = await Promise.all([
           new Response(proc.stdout).text(),
           new Response(proc.stderr).text(),
@@ -79,24 +88,9 @@ async function runGemini(
 
         const exitCode = await proc.exited;
 
-        if (exitCode !== 0) {
-          return { success: false, output: "", error: stderr || `Exit code ${exitCode}` };
+        if (timedOut) {
+          return { success: false, output: "", error: `Timeout after ${timeout / 1000}s (process was killed)` };
         }
-
-        return { success: true, output: stdout.trim() };
-      } else {
-        // No stdin, just run with prompt as positional argument
-        const proc = Bun.spawn(["gemini", "-m", "pro", "-o", "text", prompt], {
-          stdout: "pipe",
-          stderr: "pipe",
-        });
-
-        const [stdout, stderr] = await Promise.all([
-          new Response(proc.stdout).text(),
-          new Response(proc.stderr).text(),
-        ]);
-
-        const exitCode = await proc.exited;
 
         if (exitCode !== 0) {
           return { success: false, output: "", error: stderr || `Exit code ${exitCode}` };
@@ -105,12 +99,36 @@ async function runGemini(
         const elapsed = Math.round((Date.now() - startTime) / 1000);
         sendProgress(`Gemini completed in ${elapsed}s`);
         return { success: true, output: stdout.trim() };
+      } finally {
+        clearTimeout(timeoutId);
+        clearInterval(progressInterval);
       }
-    } finally {
-      clearInterval(progressInterval);
+    } catch (error) {
+      return { success: false, output: "", error: extractErrorMessage(error) };
     }
-  } catch (error) {
-    return { success: false, output: "", error: extractErrorMessage(error) };
+  } else {
+    // No stdin: use spawnWithTimeout for proper timeout handling
+    const result = await spawnWithTimeout({
+      command: "gemini",
+      args: ["-m", "pro", "-o", "text", prompt],
+      timeoutMs: timeout,
+      onProgress: (chars, elapsedMs) => {
+        const elapsed = Math.round(elapsedMs / 1000);
+        sendProgress(`Gemini processing... (${elapsed}s elapsed, ${chars} chars)`);
+      },
+      progressIntervalMs: 5000,
+    });
+
+    if (result.timedOut) {
+      return { success: false, output: "", error: `Timeout after ${timeout / 1000}s (process was killed)` };
+    }
+
+    if (!result.success) {
+      return { success: false, output: "", error: result.error || result.stderr || `Exit code ${result.exitCode}` };
+    }
+
+    sendProgress(`Gemini completed in ${(result.durationMs / 1000).toFixed(1)}s`);
+    return { success: true, output: result.stdout.trim() };
   }
 }
 
@@ -290,13 +308,31 @@ export async function compare(args: {
 export async function think(args: {
   problem: string;
   constraints?: string;
+  /** Include codebase structure context (default: true) */
+  include_codemap?: boolean;
 }): Promise<{ success: boolean; reasoning?: string; error?: string }> {
   log.call("think", args);
-  const { problem, constraints } = args;
+  const { problem, constraints, include_codemap = true } = args;
+
+  // Get code map context for codebase awareness (if enabled)
+  let codebaseSection = "";
+  if (include_codemap) {
+    sendProgress("Loading codebase structure...");
+    const codeMapContext = await getCodeMapContext();
+    if (codeMapContext) {
+      codebaseSection = `\n\n<codebase-structure>\n${codeMapContext}\n</codebase-structure>`;
+      log.info(`Loaded code map context (${codeMapContext.length} chars)`);
+    } else {
+      log.info("No code map available (not a git repo or generation failed)");
+    }
+  }
 
   let prompt = `Think through this problem step by step:\n\n${problem}`;
   if (constraints) {
     prompt += `\n\nConstraints/Requirements:\n${constraints}`;
+  }
+  if (codebaseSection) {
+    prompt += codebaseSection;
   }
   prompt += "\n\nProvide your reasoning and conclusion.";
 
@@ -775,6 +811,8 @@ export async function reason_through(args: {
   file_paths?: string[];
   constraints?: string[];
   output_format?: "reasoning" | "decision" | "both";
+  /** Include codebase structure context (default: true) */
+  include_codemap?: boolean;
 }): Promise<{
   success: boolean;
   reasoning?: string;
@@ -783,7 +821,20 @@ export async function reason_through(args: {
   error?: string;
 }> {
   log.call("reason_through", args);
-  const { problem, file_paths, constraints, output_format = "both" } = args;
+  const { problem, file_paths, constraints, output_format = "both", include_codemap = true } = args;
+
+  // Get code map context for overall codebase awareness (if enabled)
+  let codebaseSection = "";
+  if (include_codemap) {
+    sendProgress("Loading codebase structure...");
+    const codeMapContext = await getCodeMapContext();
+    if (codeMapContext) {
+      codebaseSection = `\n\n<codebase-structure>\n${codeMapContext}\n</codebase-structure>`;
+      log.info(`Loaded code map context (${codeMapContext.length} chars)`);
+    } else {
+      log.info("No code map available (not a git repo or generation failed)");
+    }
+  }
 
   let context = "";
   if (file_paths && file_paths.length > 0) {
@@ -796,7 +847,7 @@ export async function reason_through(args: {
     }
   }
 
-  let prompt = `Think through this problem carefully and systematically:\n\n${problem}`;
+  let prompt = `Think through this problem carefully and systematically:\n\n${problem}${codebaseSection}`;
 
   if (constraints && constraints.length > 0) {
     prompt += `\n\nConstraints to consider:\n${constraints.map((c) => `- ${c}`).join("\n")}`;

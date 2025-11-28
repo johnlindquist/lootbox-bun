@@ -141,6 +141,8 @@ export class WebSocketRpcServer {
     this.setupRoutes();
 
     // Phase 7: Start file watcher with targeted worker restarts
+    // Uses backoff mechanism to prevent rapid retries on failing files
+    const fileWatcherManager = this.fileWatcherManager;
     this.fileWatcherManager.startWatching(config.tools_dir, async (changedFiles) => {
       if (!this.workerManager) return;
 
@@ -158,22 +160,46 @@ export class WebSocketRpcServer {
         if (!currentFiles.has(path)) {
           console.error(`[Server] File removed: ${file.name}`);
           await this.workerManager.stopWorker(file.name);
+          // Clear any backoff state for removed files
+          fileWatcherManager.resetFileBackoff(path);
         }
       }
 
-      // 5. Handle Adds and Modifications
+      // 5. Handle Adds and Modifications (in parallel for performance)
+      const operations: Promise<void>[] = [];
+
       for (const [path, file] of currentFiles) {
         const isNew = !previousFiles.has(path);
         const isModified = changedFiles.has(path);
 
-        if (isNew) {
-          console.error(`[Server] New file detected: ${file.name}`);
-          await this.workerManager.startWorker(file);
-        } else if (isModified) {
-          console.error(`[Server] File modified: ${file.name}`);
-          await this.workerManager.restartWorker(file.name, file);
+        if (isNew || isModified) {
+          const operation = async () => {
+            try {
+              if (isNew) {
+                console.error(`[Server] New file detected: ${file.name}`);
+                await this.workerManager!.startWorker(file);
+              } else {
+                console.error(`[Server] File modified: ${file.name}`);
+                await this.workerManager!.restartWorker(file.name, file);
+              }
+              // Success - clear any previous backoff
+              fileWatcherManager.recordSuccess(path);
+            } catch (err) {
+              const errorMsg = err instanceof Error ? err.message : String(err);
+              console.error(`[Server] Failed to ${isNew ? 'start' : 'restart'} worker ${file.name}: ${errorMsg}`);
+              // Record failure for exponential backoff
+              const isBlocked = fileWatcherManager.recordFailure(path);
+              if (isBlocked) {
+                console.error(`[Server] File ${file.name} blocked after repeated failures - fix the error and save again`);
+              }
+            }
+          };
+          operations.push(operation());
         }
       }
+
+      // Wait for all operations to complete
+      await Promise.all(operations);
     });
 
     // Phase 8: Start HTTP server using Bun
@@ -226,12 +252,17 @@ export class WebSocketRpcServer {
     // Give server time to start
     await new Promise((resolve) => setTimeout(resolve, 100));
 
-    // Phase 9: Initialize workers for all RPC files
+    // Phase 9: Initialize workers for all RPC files (parallelized with concurrency limit)
     const uniqueFiles = this.rpcCacheManager.getUniqueFiles();
-    for (const file of uniqueFiles.values()) {
-      await this.workerManager!.startWorker(file);
+    const files = Array.from(uniqueFiles.values());
+
+    // Start workers in parallel batches of 5 to avoid overwhelming the system
+    const CONCURRENCY_LIMIT = 5;
+    for (let i = 0; i < files.length; i += CONCURRENCY_LIMIT) {
+      const batch = files.slice(i, i + CONCURRENCY_LIMIT);
+      await Promise.all(batch.map(file => this.workerManager!.startWorker(file)));
     }
-    console.error(`[Server] Started ${uniqueFiles.size} workers`);
+    console.error(`[Server] Started ${uniqueFiles.size} workers (parallel batches of ${CONCURRENCY_LIMIT})`);
 
     // Wait for workers to be ready
     await this.workerManager.waitForReady(5000);
@@ -288,13 +319,15 @@ export class WebSocketRpcServer {
    */
   private setupRoutes(): void {
     // Setup OpenAPI-documented REST routes
+    const workerManager = this.workerManager;
     const openApiHandler = new OpenApiRouteHandler(
       this.app,
       this.rpcCacheManager,
       this.typeGeneratorManager,
       this.mcpIntegrationManager,
       get_client,
-      this.currentPort
+      this.currentPort,
+      () => workerManager
     );
     openApiHandler.setupRoutes();
 

@@ -13,7 +13,7 @@
  * - Multiple export formats
  */
 
-import { createLogger, extractErrorMessage, type ProgressCallback } from "./shared/index.ts";
+import { createLogger, extractErrorMessage, type ProgressCallback, getCodeMapContext } from "./shared/index.ts";
 import { saveToolResponse } from "./shared/response_history.ts";
 
 const log = createLogger("brainstorm");
@@ -211,6 +211,7 @@ async function queryAgent(
  * @param args.constraints - Optional constraints to apply (preset name or custom string)
  * @param args.agents - Which agents to use (defaults to all)
  * @param args.timeout_seconds - Timeout per agent (default: 90)
+ * @param args.include_codemap - Include codebase structure context (default: true)
  */
 export async function generate(args: {
   topic: string;
@@ -218,6 +219,8 @@ export async function generate(args: {
   constraints?: ConstraintPreset | string;
   agents?: AgentName[];
   timeout_seconds?: number;
+  /** Include codebase structure context (default: true) */
+  include_codemap?: boolean;
 }): Promise<BrainstormResult> {
   log.call("generate", args);
   const {
@@ -226,6 +229,7 @@ export async function generate(args: {
     constraints,
     agents = ["claude", "codex", "gemini"],
     timeout_seconds = 90,
+    include_codemap = true,
   } = args;
 
   if (!topic || topic.trim().length === 0) {
@@ -238,6 +242,19 @@ export async function generate(args: {
 
   sendProgress(`Starting ${modeConfig.name} brainstorm with ${agents.length} agents...`);
 
+  // Get code map context for codebase awareness (if enabled)
+  let codebaseSection = "";
+  if (include_codemap) {
+    sendProgress("Loading codebase structure...");
+    const codeMapContext = await getCodeMapContext();
+    if (codeMapContext) {
+      codebaseSection = `\n\n<codebase-structure>\n${codeMapContext}\n</codebase-structure>\n`;
+      log.info(`Loaded code map context (${codeMapContext.length} chars)`);
+    } else {
+      log.info("No code map available (not a git repo or generation failed)");
+    }
+  }
+
   // Build constraint string
   const constraintText = constraints
     ? (constraints in CONSTRAINT_PRESETS
@@ -248,7 +265,7 @@ export async function generate(args: {
   // Query all agents in parallel with mode-specific prompts
   const queries = agents.map((agentKey) => {
     const modePrompt = modeConfig.agentPrompts[agentKey];
-    const fullPrompt = `BRAINSTORM TOPIC: ${topic}
+    const fullPrompt = `BRAINSTORM TOPIC: ${topic}${codebaseSection}
 
 ${modePrompt}
 

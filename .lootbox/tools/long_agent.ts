@@ -17,7 +17,7 @@
 import { $ } from "bun";
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
 import { join, dirname } from "node:path";
-import { createLogger, extractErrorMessage } from "./shared/index.ts";
+import { createLogger, extractErrorMessage, getCodeMapContext } from "./shared/index.ts";
 
 const log = createLogger("long_agent");
 
@@ -189,11 +189,15 @@ echo "✅ Environment ready!"
  * - Recent git commits
  * - Progress file contents
  * - Feature list summary
+ * - Codebase structure (code map)
  *
  * @param args.project_path - Path to the project directory
+ * @param args.include_codemap - Include codebase structure context (default: true)
  */
 export async function get_bearings(args: {
   project_path: string;
+  /** Include codebase structure context (default: true) */
+  include_codemap?: boolean;
 }): Promise<{
   success: boolean;
   bearings?: {
@@ -206,12 +210,14 @@ export async function get_bearings(args: {
       failing: number;
       next_feature?: Feature;
     };
+    /** Codebase structure map showing files, exports, and signatures */
+    codemap?: string;
   };
   error?: string;
 }> {
   log.call("get_bearings", args);
 
-  const { project_path } = args;
+  const { project_path, include_codemap = true } = args;
 
   try {
     // Get current directory
@@ -255,14 +261,27 @@ export async function get_bearings(args: {
       };
     }
 
+    // Get codebase structure map
+    let codemap: string | undefined;
+    if (include_codemap) {
+      const codeMapContext = await getCodeMapContext(project_path);
+      if (codeMapContext) {
+        codemap = codeMapContext;
+        log.info(`Loaded code map context (${codeMapContext.length} chars)`);
+      } else {
+        log.info("No code map available (not a git repo or generation failed)");
+      }
+    }
+
     const bearings = {
       cwd,
       git_log: gitLog,
       progress,
       feature_summary: featureSummary,
+      codemap,
     };
 
-    log.success("get_bearings", { total: featureSummary.total, passing: featureSummary.passing });
+    log.success("get_bearings", { total: featureSummary.total, passing: featureSummary.passing, hasCodemap: !!codemap });
     return { success: true, bearings };
   } catch (error) {
     const errorMsg = extractErrorMessage(error);

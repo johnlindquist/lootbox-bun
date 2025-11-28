@@ -17,7 +17,7 @@
  * 6. Report: Produce structured output
  */
 
-import { createLogger, extractErrorMessage, type ProgressCallback } from "./shared/index.ts";
+import { createLogger, extractErrorMessage, type ProgressCallback, spawnWithTimeout, getCodeMapContext } from "./shared/index.ts";
 import { saveToolResponse } from "./shared/response_history.ts";
 
 const log = createLogger("deep_research");
@@ -56,18 +56,18 @@ interface AgentAnalysis {
 
 /**
  * Run a Gemini web search query
+ * Uses spawnWithTimeout for proper timeout handling
  */
 async function runGeminiSearch(
   query: string,
   focus?: string,
   timeout = 60000
 ): Promise<SearchResult> {
-  try {
-    let prompt = `Search the web and provide comprehensive, up-to-date information about: ${query}`;
-    if (focus) {
-      prompt += `\n\nFocus on: ${focus}`;
-    }
-    prompt += `\n\nProvide detailed findings with:
+  let prompt = `Search the web and provide comprehensive, up-to-date information about: ${query}`;
+  if (focus) {
+    prompt += `\n\nFocus on: ${focus}`;
+  }
+  prompt += `\n\nProvide detailed findings with:
 - Key facts and data
 - Recent developments
 - Expert opinions or consensus
@@ -75,38 +75,32 @@ async function runGeminiSearch(
 
 Be thorough and include specific details.`;
 
-    const proc = Bun.spawn(["gemini", "-m", "pro", "-o", "text", prompt], {
-      stdout: "pipe",
-      stderr: "pipe",
-    });
+  const result = await spawnWithTimeout({
+    command: "gemini",
+    args: ["-m", "pro", "-o", "text", prompt],
+    timeoutMs: timeout,
+  });
 
-    const [stdout, stderr] = await Promise.all([
-      new Response(proc.stdout).text(),
-      new Response(proc.stderr).text(),
-    ]);
-
-    const exitCode = await proc.exited;
-
-    if (exitCode !== 0) {
-      return { query, success: false, error: stderr || `Exit code ${exitCode}` };
-    }
-
-    return { query, success: true, content: stdout.trim() };
-  } catch (error) {
-    return { query, success: false, error: extractErrorMessage(error) };
+  if (result.timedOut) {
+    return { query, success: false, error: `Search timed out after ${timeout / 1000}s` };
   }
+
+  if (!result.success) {
+    return { query, success: false, error: result.error || `Exit code ${result.exitCode}` };
+  }
+
+  return { query, success: true, content: result.stdout.trim() };
 }
 
 /**
  * Query a single agent for analysis
+ * Uses spawnWithTimeout for proper timeout handling
  */
 async function queryAgentForAnalysis(
   agent: "claude" | "codex" | "gemini",
   prompt: string,
   timeout = 120000
 ): Promise<AgentAnalysis> {
-  const startTime = Date.now();
-
   const configs = {
     claude: {
       command: "claude",
@@ -127,44 +121,50 @@ async function queryAgentForAnalysis(
 
   const config = configs[agent];
 
-  try {
-    const proc = Bun.spawn([config.command, ...config.args, prompt], {
-      stdout: "pipe",
-      stderr: "pipe",
-      env: { ...process.env, CI: "true", TERM: "dumb" },
-    });
+  const result = await spawnWithTimeout({
+    command: config.command,
+    args: [...config.args, prompt],
+    timeoutMs: timeout,
+    env: { CI: "true", TERM: "dumb" },
+  });
 
-    const stdout = await new Response(proc.stdout).text();
-    const stderr = await new Response(proc.stderr).text();
-    const exitCode = await proc.exited;
-    const duration_ms = Date.now() - startTime;
-
-    if (exitCode !== 0) {
-      return { agent: config.name, success: false, error: stderr || `Exit code ${exitCode}`, duration_ms };
-    }
-
-    // Parse JSONL for codex
-    let analysis = stdout.trim();
-    if (agent === "codex") {
-      const lines = analysis.split("\n").filter((l) => l.trim());
-      const textParts: string[] = [];
-      for (const line of lines) {
-        try {
-          const obj = JSON.parse(line);
-          if (obj.message) textParts.push(obj.message);
-          else if (obj.content) textParts.push(obj.content);
-          else if (obj.text) textParts.push(obj.text);
-        } catch {
-          if (!line.startsWith("{")) textParts.push(line);
-        }
-      }
-      analysis = textParts.join("\n") || analysis;
-    }
-
-    return { agent: config.name, success: true, analysis, duration_ms };
-  } catch (error) {
-    return { agent: config.name, success: false, error: extractErrorMessage(error), duration_ms: Date.now() - startTime };
+  if (result.timedOut) {
+    return {
+      agent: config.name,
+      success: false,
+      error: `Agent timed out after ${timeout / 1000}s`,
+      duration_ms: result.durationMs,
+    };
   }
+
+  if (!result.success) {
+    return {
+      agent: config.name,
+      success: false,
+      error: result.error || `Exit code ${result.exitCode}`,
+      duration_ms: result.durationMs,
+    };
+  }
+
+  // Parse JSONL for codex
+  let analysis = result.stdout.trim();
+  if (agent === "codex") {
+    const lines = analysis.split("\n").filter((l) => l.trim());
+    const textParts: string[] = [];
+    for (const line of lines) {
+      try {
+        const obj = JSON.parse(line);
+        if (obj.message) textParts.push(obj.message);
+        else if (obj.content) textParts.push(obj.content);
+        else if (obj.text) textParts.push(obj.text);
+      } catch {
+        if (!line.startsWith("{")) textParts.push(line);
+      }
+    }
+    analysis = textParts.join("\n") || analysis;
+  }
+
+  return { agent: config.name, success: true, analysis, duration_ms: result.durationMs };
 }
 
 // ============================================================================
@@ -297,6 +297,8 @@ export async function deep_research(args: {
   focus?: string;
   include_gaps?: boolean;
   timeout_seconds?: number;
+  /** Include codebase structure context (default: true) */
+  include_codemap?: boolean;
 }): Promise<DeepResearchResult> {
   log.call("deep_research", args);
   const {
@@ -305,6 +307,7 @@ export async function deep_research(args: {
     focus,
     include_gaps = true,
     timeout_seconds = 300,
+    include_codemap = true,
   } = args;
 
   if (!topic || topic.trim().length === 0) {
@@ -324,6 +327,19 @@ export async function deep_research(args: {
 
   const startTime = Date.now();
   const numAngles = depth === "quick" ? 3 : depth === "standard" ? 5 : 8;
+
+  // Get code map context for codebase awareness (if enabled)
+  let codebaseSection = "";
+  if (include_codemap) {
+    sendProgress("Loading codebase structure...");
+    const codeMapContext = await getCodeMapContext();
+    if (codeMapContext) {
+      codebaseSection = `\n\n<codebase-structure>\n${codeMapContext}\n</codebase-structure>`;
+      log.info(`Loaded code map context (${codeMapContext.length} chars)`);
+    } else {
+      log.info("No code map available (not a git repo or generation failed)");
+    }
+  }
 
   sendProgress(`Starting deep research on: ${topic} (${depth} depth, ${numAngles} angles)`);
 
@@ -376,7 +392,7 @@ export async function deep_research(args: {
     .map((r, i) => `## ${expandedQueries.angles[i]?.angle || `Finding ${i + 1}`}\n${r.content}`)
     .join("\n\n---\n\n");
 
-  const synthesisPrompt = `You are a research analyst. Analyze these research findings on "${topic}" and provide:
+  const synthesisPrompt = `You are a research analyst. Analyze these research findings on "${topic}" and provide:${codebaseSection}
 
 ## Research Findings:
 ${combinedFindings}
